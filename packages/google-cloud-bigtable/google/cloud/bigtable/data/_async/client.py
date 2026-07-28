@@ -1383,7 +1383,9 @@ class _DataApiTargetAsync(abc.ABC):
             # the daemon's independent ADC resolution could land on a different
             # principal. Verify before routing any RPC through it.
             self._verify_daemon_identity(server)
-            self._accelerator_client = AcceleratorClientType(server.uds_path)
+            self._accelerator_client = AcceleratorClientType(
+                server.uds_path, server.auth_secret
+            )
         except _AcceleratorUnverified:
             server.close()
             warnings.warn(
