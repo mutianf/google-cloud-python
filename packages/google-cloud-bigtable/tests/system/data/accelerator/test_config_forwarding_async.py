@@ -61,8 +61,8 @@ class TestConfigForwardingAsync(AcceleratorTestBase):
         token audience matches."""
         flags = await self._accelerator_flags_for()
         assert "--scopes" in flags
-        # Also forwards a caller user-agent so the daemon can build the UA prefix.
-        assert "--caller-user-agent" in flags
+        # Also forwards the client's user-agent so the daemon can build the UA prefix.
+        assert "--user-agent" in flags
 
     @CrossSync.pytest
     async def test_quota_project_forwarded_to_flags(self):

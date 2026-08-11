@@ -54,7 +54,7 @@ class TestConfigForwarding(AcceleratorTestBase):
         token audience matches."""
         flags = self._accelerator_flags_for()
         assert "--scopes" in flags
-        assert "--caller-user-agent" in flags
+        assert "--user-agent" in flags
 
     def test_quota_project_forwarded_to_flags(self):
         flags = self._accelerator_flags_for(quota_project_id="my-quota-project")

@@ -422,9 +422,9 @@ class BigtableDataClientAsync(ClientWithProject):
 
         # Identify this client to the daemon so it can construct the full
         # User-Agent prefix (e.g. "python-v3.0.0a0-go-accelerator-v3.x.x").
-        # The daemon appends its own "-go-accelerator-vX.Y.Z" suffix.
+        # The daemon prepends this to its own "-go-accelerator-vX.Y.Z" token.
         self._accelerator_flags += [
-            "--caller-user-agent",
+            "--user-agent",
             f"python-v{google.cloud.bigtable.__version__}",
         ]
 
