@@ -31,7 +31,7 @@ import subprocess
 import tempfile
 import time
 import typing
-from typing import Sequence
+from typing import Mapping, Sequence
 
 # Environment variable that overrides the bundled binary location. Primarily
 # for development against a locally-built daemon, and for tests pointing at a
@@ -97,10 +97,15 @@ class AcceleratorDaemon:
         *,
         binary_path: str | None = None,
         startup_timeout: float = _DEFAULT_STARTUP_TIMEOUT,
+        extra_env: Mapping[str, str] | None = None,
     ):
         self._binary_path = binary_path or _resolve_binary_path()
         self._cli_flags = list(cli_flags)
         self._startup_timeout = startup_timeout
+        # Extra environment for the subprocess, merged over the inherited env.
+        # Used to forward GOOGLE_APPLICATION_CREDENTIALS (path only) so the
+        # daemon's ADC resolves the caller's credentials_file.
+        self._extra_env = dict(extra_env) if extra_env else {}
         self._tempdir: str | None = None
         self._uds_path: str | None = None
         self._log_path: str | None = None
@@ -146,6 +151,9 @@ class AcceleratorDaemon:
         self._log_path = os.path.join(self._tempdir, "daemon.log")
         self._log_file = open(self._log_path, "wb")
         argv = [self._binary_path, "--uds-path", self._uds_path, *self._cli_flags]
+        env = None
+        if self._extra_env:
+            env = {**os.environ, **self._extra_env}
         try:
             self._proc = subprocess.Popen(
                 argv,
@@ -153,6 +161,7 @@ class AcceleratorDaemon:
                 stdout=self._log_file,
                 stderr=subprocess.STDOUT,
                 close_fds=True,
+                env=env,
             )
         except OSError as exc:
             self._close_log_file()
