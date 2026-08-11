@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import shutil
 import signal
 import socket
@@ -117,6 +118,7 @@ class AcceleratorDaemon:
         self._log_path: str | None = None
         self._log_file: "typing.IO[bytes] | None" = None
         self._proc: subprocess.Popen[bytes] | None = None
+        self._auth_secret: str | None = None
 
     @property
     def uds_path(self) -> str:
@@ -139,6 +141,12 @@ class AcceleratorDaemon:
     @property
     def is_running(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
+
+    @property
+    def auth_secret(self) -> str:
+        if self._auth_secret is None:
+            raise RuntimeError("AcceleratorDaemon has not been started")
+        return self._auth_secret
 
     def start(self) -> None:
         """Spawn the daemon and wait for the UDS to become connectable."""
@@ -174,6 +182,21 @@ class AcceleratorDaemon:
             self._cleanup_tempdir()
             raise RuntimeError(
                 f"Failed to spawn accelerator daemon at {self._binary_path}: {exc}"
+            ) from exc
+        # Mint a 256-bit secret and write it to the daemon's stdin before it
+        # binds the socket. The daemon reads this line synchronously before
+        # accepting connections, then validates it on every RPC via metadata.
+        self._auth_secret = secrets.token_urlsafe(32)
+        try:
+            self._proc.stdin.write(f"{self._auth_secret}\n".encode())  # type: ignore[union-attr]
+            self._proc.stdin.flush()  # type: ignore[union-attr]
+        except (OSError, ValueError) as exc:
+            self._close_log_file()
+            self._force_kill()
+            self._cleanup_tempdir()
+            raise RuntimeError(
+                "Failed to send auth secret to accelerator daemon (process died): "
+                f"{exc}"
             ) from exc
         # The child inherited its own dup of the log fd; the parent no longer
         # needs its copy. Startup failures read the tail back from the path.
