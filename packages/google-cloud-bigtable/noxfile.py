@@ -60,6 +60,9 @@ SYSTEM_TEST_EXTERNAL_DEPENDENCIES: List[str] = [
     "pytest-asyncio==0.21.2",
     RUFF_VERSION,
     "pyyaml==6.0.2",
+    # Used by the accelerator pre-release suite for subprocess/FD/tempdir leak
+    # detection (tests/system/data/accelerator/_harness.py).
+    "psutil",
 ]
 SYSTEM_TEST_LOCAL_DEPENDENCIES: List[str] = []
 SYSTEM_TEST_DEPENDENCIES: List[str] = []
