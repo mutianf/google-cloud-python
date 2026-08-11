@@ -1,0 +1,94 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Concurrency / thread-safety tests for a shared accelerated table.
+
+A single ``Table`` (and its single ``_accelerator_client`` over one UDS) is
+driven from many concurrent workers — async tasks in the async build, real OS
+threads in the generated sync build. Each worker owns a disjoint key prefix and
+its own model, so any interleaving/corruption in the shared client surfaces as a
+per-worker mismatch or a raised exception.
+"""
+
+import concurrent.futures
+import functools
+import uuid
+
+from google.cloud.bigtable.data._cross_sync import CrossSync
+
+from . import _harness
+
+if CrossSync.is_async:
+    from ._base_async import AcceleratorTestBaseAsync as AcceleratorTestBase
+else:
+    from ._base_autogen import AcceleratorTestBase
+
+__CROSS_SYNC_OUTPUT__ = "tests.system.data.accelerator.test_concurrency_autogen"
+
+
+@CrossSync.convert_class(sync_name="TestConcurrency")
+class TestConcurrencyAsync(AcceleratorTestBase):
+    """Many concurrent callers sharing one accelerated table."""
+
+    NUM_WORKERS = 6
+    OPS_PER_WORKER = 12
+
+    @CrossSync.convert
+    async def _worker(self, table, worker_id):
+        """Do a private sequence of mutations/reads and self-verify against a
+        per-worker model. Returns the keys it touched (for cleanup)."""
+        prefix = f"conc-{worker_id}-{uuid.uuid4().hex[:8]}-".encode()
+        ops = _harness.RandomOps(worker_id, key_prefix=prefix)
+        expected_state = _harness.ExpectedState()
+        touched = set()
+        for _ in range(self.OPS_PER_WORKER):
+            key, mutation = ops.build_mutation(expected_state)
+            await table.mutate_row(key, mutation)
+            touched.add(key)
+        for key in touched:
+            row = await table.read_row(key)
+            _harness.assert_rows_equivalent(
+                f"worker-{worker_id}",
+                _harness.normalize_row(row),
+                "model",
+                expected_state.expected_cells(key),
+            )
+        return sorted(touched)
+
+    @CrossSync.pytest
+    async def test_concurrent_workers_stay_consistent(self, accel_table, janitor):
+        """Concurrent writers/readers on one shared client each see exactly their
+        own writes, with no errors."""
+        executor = (
+            concurrent.futures.ThreadPoolExecutor(max_workers=self.NUM_WORKERS)
+            if not CrossSync.is_async
+            else None
+        )
+        try:
+            partials = [
+                functools.partial(self._worker, accel_table, i)
+                for i in range(self.NUM_WORKERS)
+            ]
+            results = await CrossSync.gather_partials(
+                partials, return_exceptions=True, sync_executor=executor
+            )
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=True)
+
+        for i, result in enumerate(results):
+            assert not isinstance(result, BaseException), (
+                f"worker {i} failed: {result!r}"
+            )
+            for key in result:
+                janitor.track(key)
