@@ -18,7 +18,7 @@ does not start with ``test_``). It is a soak/stress harness meant to be run by
 hand or from CI against a real Bigtable instance, e.g. for the canonical
 pre-release 6-hour run:
 
-    python -m tests.system.data.accelerator.stress --hours 6 --qps 200
+    python -m tests.system.data.accelerator.stress --hours 6
 
 It drives the *real shipped path* end-to-end -- a real ``BigtableDataClient``
 (async by default, or the generated sync client with ``--sync``) with
@@ -27,8 +27,10 @@ bundled binary and routes ``read_row``/``mutate_row`` over the UDS. Nothing is
 faked; ``--no-accelerator`` runs the identical load over the native path so the
 two can be compared.
 
-While it runs it holds a target QPS with a token bucket across N workers, each
-owning a disjoint key prefix and its own ``ExpectedState``. Every mutation updates
+While it runs it drives load closed-loop across N workers (as fast as the path
+allows, matching the YCSB driver's default), each owning a disjoint key prefix
+and its own ``ExpectedState``. An optional ``--qps`` cap paces the workers with a
+token bucket when a bounded rate is wanted instead. Every mutation updates
 the expected state and Bigtable; periodic canary reads assert Bigtable still
 matches the expected state (correctness under sustained load). A monitor samples
 RSS / open FDs and
@@ -39,8 +41,12 @@ growth), so it is usable as a CI gate.
 
 Config comes from the standard system-test env vars
 (``GOOGLE_CLOUD_PROJECT``, ``BIGTABLE_TEST_INSTANCE``, ``BIGTABLE_TEST_TABLE``),
-overridable by flags. The instance/table must already exist with the families
-``test-family`` and ``test-family-2`` (the same the suite's conftest creates).
+overridable by flags. The instance must already exist. The table is managed for
+you: when no ``--table``/``BIGTABLE_TEST_TABLE`` is given the driver creates a
+fresh, uniquely-named table (with the families ``test-family`` and
+``test-family-2``) before the run and deletes it afterwards; when a table id *is*
+supplied it is reused as-is and left in place (never deleted). ``--keep-table``
+suppresses deletion of a self-created table for post-mortem inspection.
 """
 
 from __future__ import annotations
@@ -52,6 +58,7 @@ import os
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 
 from google.cloud.bigtable.data import BigtableDataClient, BigtableDataClientAsync
@@ -68,6 +75,7 @@ class StressConfig:
     project: str | None
     instance_id: str
     table_id: str
+    app_profile_id: str | None
     duration_seconds: float
     qps: float
     workers: int
@@ -83,6 +91,11 @@ class StressConfig:
     progress_interval: float
     # Diagnostics for the RSS-growth investigation.
     tracemalloc: bool
+    # Table lifecycle: when no table id is supplied the driver creates a fresh
+    # uniquely-named table and (unless keep_table) deletes it on exit; a supplied
+    # table id is reused as-is and never touched.
+    manage_table: bool
+    keep_table: bool
 
 
 def _build_config(argv: list[str]) -> StressConfig:
@@ -98,7 +111,13 @@ def _build_config(argv: list[str]) -> StressConfig:
         default=None,
         help="run duration in seconds (overrides --hours; for smoke tests)",
     )
-    p.add_argument("--qps", type=float, default=100.0, help="target operations/sec")
+    p.add_argument(
+        "--qps",
+        type=float,
+        default=0.0,
+        help="aggregate target operations/sec cap (0 = unlimited / closed-loop, "
+        "the default: drive as fast as the path allows)",
+    )
     p.add_argument("--workers", type=int, default=8, help="concurrent workers")
     p.add_argument(
         "--no-accelerator",
@@ -112,7 +131,21 @@ def _build_config(argv: list[str]) -> StressConfig:
     )
     p.add_argument("--project", default=None, help="GCP project (default: env)")
     p.add_argument("--instance", default=None, help="instance id (default: env)")
-    p.add_argument("--table", default=None, help="table id (default: env)")
+    p.add_argument(
+        "--table",
+        default=None,
+        help="table id (default: env, else a fresh table is created and deleted)",
+    )
+    p.add_argument(
+        "--keep-table",
+        action="store_true",
+        help="do not delete a self-created table on exit (for post-mortem)",
+    )
+    p.add_argument(
+        "--app-profile",
+        default=None,
+        help="app profile id (default: env BIGTABLE_TEST_APP_PROFILE, else none)",
+    )
     p.add_argument(
         "--sample-interval",
         type=float,
@@ -169,8 +202,8 @@ def _build_config(argv: list[str]) -> StressConfig:
     duration = args.seconds if args.seconds is not None else args.hours * 3600.0
     if duration <= 0:
         p.error("duration must be positive")
-    if args.qps <= 0:
-        p.error("--qps must be positive")
+    if args.qps < 0:
+        p.error("--qps must be non-negative (0 = unlimited)")
     if args.workers <= 0:
         p.error("--workers must be positive")
 
@@ -178,16 +211,23 @@ def _build_config(argv: list[str]) -> StressConfig:
         args.project or os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("PROJECT_ID")
     )
     instance_id = args.instance or os.getenv("BIGTABLE_TEST_INSTANCE")
-    table_id = args.table or os.getenv("BIGTABLE_TEST_TABLE")
     if not instance_id:
         p.error("no instance id (pass --instance or set BIGTABLE_TEST_INSTANCE)")
-    if not table_id:
-        p.error("no table id (pass --table or set BIGTABLE_TEST_TABLE)")
+
+    # A supplied table is reused (and left in place); otherwise the driver owns a
+    # fresh, uniquely-named table for the run and cleans it up on exit.
+    table_id = args.table or os.getenv("BIGTABLE_TEST_TABLE")
+    manage_table = table_id is None
+    if manage_table:
+        table_id = f"accel-stress-{uuid.uuid4().hex[:12]}"
+
+    app_profile_id = args.app_profile or os.getenv("BIGTABLE_TEST_APP_PROFILE")
 
     return StressConfig(
         project=project,
         instance_id=instance_id,
         table_id=table_id,
+        app_profile_id=app_profile_id,
         duration_seconds=duration,
         qps=args.qps,
         workers=args.workers,
@@ -201,7 +241,63 @@ def _build_config(argv: list[str]) -> StressConfig:
         report_path=args.report,
         progress_interval=args.progress_interval,
         tracemalloc=args.tracemalloc,
+        manage_table=manage_table,
+        keep_table=args.keep_table,
     )
+
+
+# ---------------------------------------------------------------------------
+# Table lifecycle (self-managed when no table id is supplied)
+# ---------------------------------------------------------------------------
+
+
+def _admin_client(cfg: StressConfig):
+    """A Table Admin client, sharing the same project resolution as the run."""
+    from google.cloud.bigtable.client import Client
+
+    return Client(admin=True, project=cfg.project)
+
+
+def _create_stress_table(cfg: StressConfig) -> None:
+    """Create the run's table with the two families the load generator uses.
+
+    Idempotent: an already-existing table is reused rather than treated as an
+    error, so a ``--keep-table`` run can be re-pointed at the same id.
+    """
+    from google.api_core import exceptions
+
+    from google.cloud.bigtable_admin_v2 import types
+
+    client = _admin_client(cfg)
+    parent = f"projects/{client.project}/instances/{cfg.instance_id}"
+    families = {
+        _harness.TEST_FAMILY: types.ColumnFamily(),
+        _harness.TEST_FAMILY_2: types.ColumnFamily(),
+    }
+    print(f"[stress] creating table {parent}/tables/{cfg.table_id}", file=sys.stderr)
+    try:
+        client.table_admin_client.create_table(
+            request={
+                "parent": parent,
+                "table_id": cfg.table_id,
+                "table": {"column_families": families},
+            }
+        )
+    except exceptions.AlreadyExists:
+        print("[stress] table already exists; reusing", file=sys.stderr)
+
+
+def _delete_stress_table(cfg: StressConfig) -> None:
+    """Best-effort delete of a self-created table; never masks the run result."""
+    client = _admin_client(cfg)
+    name = (
+        f"projects/{client.project}/instances/{cfg.instance_id}/tables/{cfg.table_id}"
+    )
+    print(f"[stress] deleting table {name}", file=sys.stderr)
+    try:
+        client.table_admin_client.delete_table(name=name)
+    except Exception as exc:  # noqa: BLE001 - cleanup must not raise over the report
+        print(f"[stress] failed to delete table {name}: {exc}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -286,12 +382,22 @@ class StressStats:
 
 
 def _canary_mismatch(worker_id: int, key: bytes, row, expected_state) -> str | None:
-    """Return a human-readable mismatch string, or None if the row matches."""
+    """Return a human-readable mismatch string, or None if the row matches.
+
+    On a mismatch the string also carries the recent per-key mutation history
+    (bounded; see ``_harness.OP_HISTORY_PER_KEY``) so a rare divergence is
+    root-causable from the report without a reproduction run.
+    """
     got = _harness.normalize_row(row)
     expected = expected_state.expected_cells(key)
     if got == expected:
         return None
-    return f"worker {worker_id} key {key!r}: got {got!r} expected {expected!r}"
+    history = expected_state.history(key)
+    history_str = "\n    ".join(history) if history else "(no recorded history)"
+    return (
+        f"worker {worker_id} key {key!r}: got {got!r} expected {expected!r}\n"
+        f"  op history for {key!r} (oldest first):\n    {history_str}"
+    )
 
 
 def _worker_prefix(worker_id: int) -> bytes:
@@ -475,7 +581,7 @@ def _print_report(report: dict) -> None:
         "=" * 70,
         (
             f"mode={cfg['mode']} accelerator={cfg['accelerator']} "
-            f"workers={cfg['workers']} target_qps={cfg['target_qps']}"
+            f"workers={cfg['workers']} target_qps={cfg['target_qps'] or 'unlimited'}"
         ),
         (
             f"elapsed={report['elapsed_seconds']:.1f}s "
@@ -525,25 +631,34 @@ async def _run_async(cfg: StressConfig, stats: StressStats) -> None:
     client = BigtableDataClientAsync(
         project=cfg.project, use_accelerator=cfg.use_accelerator
     )
-    async with client, client.get_table(cfg.instance_id, cfg.table_id) as table:
+    async with (
+        client,
+        client.get_table(
+            cfg.instance_id, cfg.table_id, app_profile_id=cfg.app_profile_id
+        ) as table,
+    ):
         _assert_mode(table, cfg)
         deadline = time.monotonic() + cfg.duration_seconds
-        per_worker_qps = cfg.qps / cfg.workers
+        # 0 == unlimited: workers run closed-loop, as fast as the path allows
+        # (the default, matching the YCSB driver). A positive --qps caps the
+        # aggregate rate via a per-worker token bucket.
+        per_worker_qps = cfg.qps / cfg.workers if cfg.qps > 0 else 0.0
 
         async def worker(worker_id: int) -> None:
             ops = _harness.RandomOps(worker_id, key_prefix=_worker_prefix(worker_id))
             expected_state = _harness.ExpectedState()
-            bucket = _harness.TokenBucket(per_worker_qps)
+            bucket = _harness.TokenBucket(per_worker_qps) if per_worker_qps else None
             # Only the most-recently written key is ever re-read for the canary,
             # so track a single key rather than accumulating every key touched
             # (an unbounded list would dominate driver RSS on a multi-hour soak).
             last_key: bytes | None = None
             i = 0
             while time.monotonic() < deadline:
-                wait = bucket.time_until_next()
-                if wait > 0:
-                    await asyncio.sleep(wait)
-                bucket.consume()
+                if bucket is not None:
+                    wait = bucket.time_until_next()
+                    if wait > 0:
+                        await asyncio.sleep(wait)
+                    bucket.consume()
                 i += 1
                 key, mutation = ops.build_mutation(expected_state)
                 t0 = time.monotonic()
@@ -598,26 +713,35 @@ def _run_sync(cfg: StressConfig, stats: StressStats) -> None:
     client = BigtableDataClient(
         project=cfg.project, use_accelerator=cfg.use_accelerator
     )
-    with client, client.get_table(cfg.instance_id, cfg.table_id) as table:
+    with (
+        client,
+        client.get_table(
+            cfg.instance_id, cfg.table_id, app_profile_id=cfg.app_profile_id
+        ) as table,
+    ):
         _assert_mode(table, cfg)
         deadline = time.monotonic() + cfg.duration_seconds
-        per_worker_qps = cfg.qps / cfg.workers
+        # 0 == unlimited: workers run closed-loop, as fast as the path allows
+        # (the default, matching the YCSB driver). A positive --qps caps the
+        # aggregate rate via a per-worker token bucket.
+        per_worker_qps = cfg.qps / cfg.workers if cfg.qps > 0 else 0.0
         stop = threading.Event()
 
         def worker(worker_id: int) -> None:
             ops = _harness.RandomOps(worker_id, key_prefix=_worker_prefix(worker_id))
             expected_state = _harness.ExpectedState()
-            bucket = _harness.TokenBucket(per_worker_qps)
+            bucket = _harness.TokenBucket(per_worker_qps) if per_worker_qps else None
             # Only the most-recently written key is ever re-read for the canary,
             # so track a single key rather than accumulating every key touched
             # (an unbounded list would dominate driver RSS on a multi-hour soak).
             last_key: bytes | None = None
             i = 0
             while not stop.is_set() and time.monotonic() < deadline:
-                wait = bucket.time_until_next()
-                if wait > 0:
-                    time.sleep(wait)
-                bucket.consume()
+                if bucket is not None:
+                    wait = bucket.time_until_next()
+                    if wait > 0:
+                        time.sleep(wait)
+                    bucket.consume()
                 i += 1
                 key, mutation = ops.build_mutation(expected_state)
                 t0 = time.monotonic()
@@ -780,11 +904,19 @@ def main(argv: list[str] | None = None) -> int:
 
     print(
         f"[stress] starting {'sync' if cfg.sync else 'async'} run: "
-        f"accelerator={cfg.use_accelerator} qps={cfg.qps} workers={cfg.workers} "
-        f"duration={cfg.duration_seconds:.0f}s",
+        f"accelerator={cfg.use_accelerator} qps={cfg.qps or 'unlimited'} "
+        f"workers={cfg.workers} "
+        f"duration={cfg.duration_seconds:.0f}s table={cfg.table_id}"
+        f"{' (managed)' if cfg.manage_table else ' (reused)'}"
+        f" app_profile={cfg.app_profile_id or '(default)'}",
         file=sys.stderr,
         flush=True,
     )
+
+    # Provision the table before spinning up the client so the daemon's first
+    # RPC lands on a table that exists.
+    if cfg.manage_table:
+        _create_stress_table(cfg)
 
     if cfg.tracemalloc:
         import tracemalloc
@@ -795,38 +927,43 @@ def main(argv: list[str] | None = None) -> int:
     stats = StressStats()
     started = time.monotonic()
     try:
-        if cfg.sync:
-            _run_sync(cfg, stats)
-        else:
-            asyncio.run(_run_async(cfg, stats))
-    except KeyboardInterrupt:
-        print("[stress] interrupted; reporting partial results", file=sys.stderr)
-    elapsed = time.monotonic() - started
+        try:
+            if cfg.sync:
+                _run_sync(cfg, stats)
+            else:
+                asyncio.run(_run_async(cfg, stats))
+        except KeyboardInterrupt:
+            print("[stress] interrupted; reporting partial results", file=sys.stderr)
+        elapsed = time.monotonic() - started
 
-    report = _build_report(cfg, stats, elapsed)
-    if cfg.tracemalloc:
-        growth = _tracemalloc_growth(stats.tm_baseline)
-        top = _tracemalloc_top()
-        report["resources"]["tracemalloc_growth"] = growth
-        report["resources"]["tracemalloc_top"] = top
-        print("[stress] tracemalloc growth since warmup (leak localizer):", file=sys.stderr)
-        for line in growth:
-            print(f"  {line}", file=sys.stderr)
-        print("[stress] tracemalloc top allocators (absolute):", file=sys.stderr)
-        for line in top:
-            print(f"  {line}", file=sys.stderr)
-    _print_report(report)
-    payload = json.dumps(report, indent=2)
-    if cfg.report_path:
-        with open(cfg.report_path, "w") as f:
-            f.write(payload)
-        print(f"[stress] wrote JSON report to {cfg.report_path}", file=sys.stderr)
-        if stats.samples:
-            csv_path = _timeseries_csv_path(cfg.report_path)
-            _write_timeseries_csv(csv_path, stats)
-            print(f"[stress] wrote resource time-series to {csv_path}", file=sys.stderr)
-    else:
-        print(payload)
+        report = _build_report(cfg, stats, elapsed)
+        if cfg.tracemalloc:
+            growth = _tracemalloc_growth(stats.tm_baseline)
+            top = _tracemalloc_top()
+            report["resources"]["tracemalloc_growth"] = growth
+            report["resources"]["tracemalloc_top"] = top
+            print("[stress] tracemalloc growth since warmup (leak localizer):", file=sys.stderr)
+            for line in growth:
+                print(f"  {line}", file=sys.stderr)
+            print("[stress] tracemalloc top allocators (absolute):", file=sys.stderr)
+            for line in top:
+                print(f"  {line}", file=sys.stderr)
+        _print_report(report)
+        payload = json.dumps(report, indent=2)
+        if cfg.report_path:
+            with open(cfg.report_path, "w") as f:
+                f.write(payload)
+            print(f"[stress] wrote JSON report to {cfg.report_path}", file=sys.stderr)
+            if stats.samples:
+                csv_path = _timeseries_csv_path(cfg.report_path)
+                _write_timeseries_csv(csv_path, stats)
+                print(f"[stress] wrote resource time-series to {csv_path}", file=sys.stderr)
+        else:
+            print(payload)
+    finally:
+        # Always reclaim a self-created table, even if the run raised.
+        if cfg.manage_table and not cfg.keep_table:
+            _delete_stress_table(cfg)
 
     return 0 if report["passed"] else 1
 
