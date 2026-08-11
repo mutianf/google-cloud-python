@@ -1,0 +1,90 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Daemon lifecycle + resource-leak tests.
+
+The daemon is a real child process holding a real UDS in a ``/tmp/bt-accel-*``
+tempdir. These verify it is reaped and its resources reclaimed on close, and
+that repeated create/use/close cycles don't leak subprocesses, file descriptors,
+or tempdirs — the failure mode that would slowly exhaust a long-lived host.
+"""
+
+import os
+import uuid
+
+from google.cloud.bigtable.data._cross_sync import CrossSync
+from google.cloud.bigtable.data.mutations import DeleteAllFromRow, SetCell
+
+from . import _harness
+
+if CrossSync.is_async:
+    from ._base_async import AcceleratorTestBaseAsync as AcceleratorTestBase
+else:
+    from ._base_autogen import AcceleratorTestBase
+
+__CROSS_SYNC_OUTPUT__ = "tests.system.data.accelerator.test_lifecycle_autogen"
+
+
+@CrossSync.convert_class(sync_name="TestLifecycle")
+class TestLifecycleAsync(AcceleratorTestBase):
+    """Daemon reaping + no-leak-over-many-cycles."""
+
+    @CrossSync.convert
+    async def _one_lifecycle(self, instance_id, table_id):
+        """Create an accelerated table, do one real round-trip, close it."""
+        async with self._make_client(use_accelerator=True) as client:
+            async with client.get_table(instance_id, table_id) as table:
+                self.assert_accelerator_active(table)
+                key = f"life-{uuid.uuid4().hex}".encode()
+                await table.mutate_row(
+                    key,
+                    SetCell(
+                        _harness.TEST_FAMILY,
+                        b"q",
+                        b"v",
+                        timestamp_micros=1000 * _harness.MS,
+                    ),
+                )
+                assert (await table.read_row(key)) is not None
+                await table.mutate_row(key, DeleteAllFromRow())
+
+    @CrossSync.pytest
+    async def test_close_reaps_daemon_and_tempdir(self, instance_id, table_id):
+        """After the table context exits, the daemon process is dead and its UDS
+        tempdir is gone."""
+        async with self._make_client(use_accelerator=True) as client:
+            async with client.get_table(instance_id, table_id) as table:
+                self.assert_accelerator_active(table)
+                pid = _harness.daemon_pid(table)
+                tempdir = table._accelerator_daemon._tempdir
+                assert pid is not None and _harness.pid_alive(pid)
+                assert tempdir is not None and os.path.exists(tempdir)
+            # table context exited -> close() ran
+            assert not _harness.pid_alive(pid), (
+                "daemon subprocess still alive after table close"
+            )
+            assert not os.path.exists(tempdir), (
+                "daemon UDS tempdir not cleaned up after table close"
+            )
+
+    @CrossSync.pytest
+    async def test_no_leaks_over_repeated_lifecycles(self, instance_id, table_id):
+        """Many create/use/close cycles must not accumulate daemons, fds, or
+        tempdirs."""
+        introspector = _harness.ProcessIntrospector()
+        # One warmup cycle so first-time, cached allocations aren't counted.
+        await self._one_lifecycle(instance_id, table_id)
+        before = introspector.snapshot()
+        for i in range(8):
+            await self._one_lifecycle(instance_id, table_id)
+        introspector.assert_no_leaks(before, label="8x accelerator lifecycle")
