@@ -28,7 +28,7 @@ from google.cloud.bigtable.data._accelerator._daemon import AcceleratorDaemon
 
 from . import _harness
 
-_FLAGS = ["--project", "p", "--instance", "i"]
+_FLAGS = ["--project", "p", "--instance", "i", "--app-profile", "ap"]
 
 
 def test_missing_binary_raises_at_construction(tmp_bin_dir, monkeypatch):
