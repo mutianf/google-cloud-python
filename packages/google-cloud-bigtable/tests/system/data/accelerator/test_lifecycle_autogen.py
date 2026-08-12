@@ -22,13 +22,51 @@ that repeated create/use/close cycles don't leak subprocesses, file descriptors,
 or tempdirs — the failure mode that would slowly exhaust a long-lived host.
 """
 
+import multiprocessing
 import os
+import shutil
+import signal
+import time
 import uuid
 
 from google.cloud.bigtable.data.mutations import DeleteAllFromRow, SetCell
 
 from . import _harness
 from ._base_autogen import AcceleratorTestBase
+
+
+def _daemon_owner_process(project, instance_id, table_id, result_queue):
+    """Child-process entrypoint that simulates the owning Python SDK process.
+
+    Runs in a separate process so the parent can hard-kill it (SIGKILL, no clean
+    ``close()``) to model a crash of the Python SDK. It builds a real accelerated
+    table over the *sync* client (the daemon lifecycle is sync-only regardless of
+    the caller's IO model), reports the daemon's pid + tempdir back to the parent,
+    then blocks forever waiting to be killed. It deliberately never closes the
+    client: on kill the daemon is orphaned and must reap itself via its stdin-EOF
+    watchdog. Defined at module scope so it is importable by ``multiprocessing``.
+    """
+    from google.cloud.bigtable.data import BigtableDataClient
+
+    with BigtableDataClient(project=project, use_accelerator=True) as client:
+        with client.get_table(instance_id, table_id) as table:
+            key = f"crash-{uuid.uuid4().hex}".encode()
+            # A real round-trip so the daemon is fully started and routing.
+            table.mutate_row(
+                key,
+                SetCell(
+                    _harness.TEST_FAMILY,
+                    b"q",
+                    b"v",
+                    timestamp_micros=1000 * _harness.MS,
+                ),
+            )
+            table.mutate_row(key, DeleteAllFromRow())
+            result_queue.put(
+                (_harness.daemon_pid(table), table._accelerator_daemon._tempdir)
+            )
+            while True:
+                time.sleep(3600)
 
 
 class TestLifecycle(AcceleratorTestBase):
@@ -78,3 +116,78 @@ class TestLifecycle(AcceleratorTestBase):
         for i in range(8):
             self._one_lifecycle(instance_id, table_id)
         introspector.assert_no_leaks(before, label="8x accelerator lifecycle")
+
+    def test_close_reclaims_resources_after_daemon_crash(self, instance_id, table_id):
+        """Non-happy path: the daemon dies unexpectedly *before* close().
+
+        A normal ``close()`` against an already-dead daemon must still reap it
+        (a no-op) and reclaim its tempdir rather than leaking either — the daemon
+        crashing must not turn into a resource leak on the client side.
+        """
+        introspector = _harness.ProcessIntrospector()
+        before = introspector.snapshot()
+        with self._make_client(use_accelerator=True) as client:
+            with client.get_table(instance_id, table_id) as table:
+                self.assert_accelerator_active(table)
+                pid = _harness.daemon_pid(table)
+                tempdir = table._accelerator_daemon._tempdir
+                assert pid is not None and _harness.pid_alive(pid)
+                assert tempdir is not None and os.path.exists(tempdir)
+                # Kill the daemon out from under the client (a daemon crash).
+                os.kill(pid, signal.SIGKILL)
+                deadline = time.monotonic() + 10.0
+                while _harness.pid_alive(pid) and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                assert not _harness.pid_alive(pid), "daemon did not die after SIGKILL"
+            # table/client context exited -> close() ran against the dead daemon.
+            assert not os.path.exists(tempdir), (
+                "close() did not reclaim the tempdir after the daemon crashed"
+            )
+        introspector.assert_no_leaks(before, label="daemon-crash teardown")
+
+    def test_no_daemon_leak_when_owner_process_is_killed(self, instance_id, table_id):
+        """Non-happy path: the owning Python SDK process crashes (SIGKILL).
+
+        A hard kill of the owner never runs ``close()``, so the daemon is
+        orphaned. It must notice its parent vanished (its stdin pipe reaches EOF)
+        and exit on its own rather than lingering as a leaked subprocess holding a
+        session pool. Run in a child process so we can kill the owner without
+        taking down the test runner; the daemon is a grandchild that reparents to
+        init on the kill, so we track it by pid rather than via the introspector.
+        """
+        project = os.getenv("GOOGLE_CLOUD_PROJECT") or None
+        ctx = multiprocessing.get_context("fork")
+        result_queue = ctx.Queue()
+        owner = ctx.Process(
+            target=_daemon_owner_process,
+            args=(project, instance_id, table_id, result_queue),
+        )
+        owner.start()
+        daemon_pid = tempdir = None
+        try:
+            daemon_pid, tempdir = result_queue.get(timeout=120)
+            assert daemon_pid is not None, (
+                "accelerator fell back to native in the owner process"
+            )
+            assert _harness.pid_alive(daemon_pid), "daemon not alive after owner start"
+            # Simulate the SDK crashing: SIGKILL the owner, no clean close().
+            owner.kill()
+            owner.join(timeout=10)
+            assert not owner.is_alive(), "owner process not reaped after SIGKILL"
+            # The orphaned daemon must self-terminate via its stdin-EOF watchdog.
+            deadline = time.monotonic() + 30.0
+            while _harness.pid_alive(daemon_pid) and time.monotonic() < deadline:
+                time.sleep(0.1)
+            assert not _harness.pid_alive(daemon_pid), (
+                f"orphaned daemon (pid {daemon_pid}) still alive 30s after its owner "
+                "was killed; stdin-EOF watchdog did not reap it"
+            )
+        finally:
+            if owner.is_alive():
+                owner.kill()
+                owner.join()
+            # A hard crash bypasses close(), so the wrapper's tempdir is left
+            # behind (a later daemon's startup stale-tempdir sweep reclaims it,
+            # not the crash). Remove it here so the test leaves no residue.
+            if tempdir and os.path.isdir(tempdir):
+                shutil.rmtree(tempdir, ignore_errors=True)
