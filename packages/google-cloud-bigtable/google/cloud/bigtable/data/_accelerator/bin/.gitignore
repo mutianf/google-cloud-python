@@ -1,0 +1,4 @@
+# The accelerator daemon binary is bundled per-wheel by the build matrix; the
+# source tree only ships an empty directory.
+*
+!.gitignore

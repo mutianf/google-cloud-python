@@ -19,6 +19,37 @@ import re
 
 import setuptools  # type: ignore
 
+
+class _BinaryDistribution(setuptools.Distribution):
+    """Forces bdist_wheel to emit a platform-tagged wheel instead of
+    py3-none-any. The wheel ships the prebuilt accelerator daemon binary
+    (google/cloud/bigtable/data/_accelerator/bin/accelerator) when present.
+    Use --plat-name on bdist_wheel to set the actual platform tag.
+    """
+
+    def has_ext_modules(self):  # noqa: D401 - setuptools API
+        return True
+
+
+# The bundled binary is a standalone executable, not a CPython extension
+# module — so the wheel's Python+ABI tag should be (py3, none), not
+# (cp311, cp311). One linux/amd64 wheel works for any Python 3.x interpreter.
+try:
+    from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
+
+    class _BDistWheel(_bdist_wheel):
+        def finalize_options(self):
+            super().finalize_options()
+            self.root_is_pure = False
+
+        def get_tag(self):
+            _python, _abi, plat = super().get_tag()
+            return ("py3", "none", plat)
+
+    _cmdclass = {"bdist_wheel": _BDistWheel}
+except ImportError:
+    _cmdclass = {}
+
 package_root = os.path.abspath(os.path.dirname(__file__))
 
 name = "google-cloud-bigtable"
@@ -29,12 +60,11 @@ description = "Google Cloud Bigtable API client library"
 version = None
 
 with open(os.path.join(package_root, "google/cloud/bigtable/gapic_version.py")) as fp:
-    version_candidates = re.findall(
-        r"(?<=\")\d+\.\d+\.\d+[^\"\s]*(?=\")",
-        fp.read(),
-    )
-    assert len(version_candidates) == 1
-    version = version_candidates[0]
+    # Accept any PEP 440 version string (pre-releases, local segments, etc.),
+    # not just bare X.Y.Z.
+    match = re.search(r'__version__\s*=\s*"([^"]+)"', fp.read())
+    assert match, "could not find __version__ in gapic_version.py"
+    version = match.group(1)
 
 if version[0] == "0":
     release_status = "Development Status :: 4 - Beta"
@@ -92,14 +122,16 @@ setuptools.setup(
         "Programming Language :: Python :: 3.12",
         "Programming Language :: Python :: 3.13",
         "Programming Language :: Python :: 3.14",
-        "Operating System :: OS Independent",
+        "Operating System :: POSIX :: Linux",
         "Topic :: Internet",
     ],
-    platforms="Posix; MacOS X; Windows",
+    platforms="Linux",
     packages=packages,
     python_requires=">=3.10",
     install_requires=dependencies,
     extras_require=extras,
     include_package_data=True,
     zip_safe=False,
+    distclass=_BinaryDistribution,
+    cmdclass=_cmdclass,
 )

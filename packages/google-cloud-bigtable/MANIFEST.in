@@ -15,6 +15,11 @@
 #
 include README.rst LICENSE
 recursive-include google *.py *.pyi *.json *.proto py.typed
+# Bundle the prebuilt accelerator daemon binary if present at build time.
+# The source tree ships an empty bin/ (see .gitignore); the binary is dropped
+# in by the wheel-build step.
+include google/cloud/bigtable/data/_accelerator/bin/accelerator
+include google/cloud/bigtable/data/_accelerator/bin/accelerator.exe
 recursive-include tests *
 global-exclude *.py[co]
 global-exclude __pycache__
