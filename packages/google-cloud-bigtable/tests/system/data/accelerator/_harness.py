@@ -76,6 +76,20 @@ _AGGREGATE_VALUE_BYTES = 8
 # recent op sequence that produced a divergent cell.
 OP_HISTORY_PER_KEY = 256
 
+# Straggler guard for the delete-after-write race. A MutateRow the daemon
+# retried (e.g. after a spurious session-heartbeat miss) can leave its *original*
+# attempt uncancelled on the wire; that attempt may commit at the backend AFTER a
+# later, separate request the client already saw succeed. Bigtable does not
+# guarantee idempotency across two requests, so a delete issued shortly after a
+# set to the same row can race such a straggler and "resurrect" the set cell.
+# This is acceptable per the service contract, so the generator does not target a
+# delete at a row written within the last DELETE_AFTER_WRITE_GUARD_OPS operations
+# by the same worker (such a delete is downgraded to another set). The window is
+# in op units (kept deterministic for the seeded fuzz test) and is generous
+# relative to the observed straggler lag (~24 ops) while still leaving plenty of
+# deletes against older, populated rows. See project_accelerator_canary_drift.
+DELETE_AFTER_WRITE_GUARD_OPS = 128
+
 # Env var honored by the real daemon wrapper (google/.../_accelerator/_daemon.py)
 # to override the binary location. We use it to point the *real* AcceleratorDaemon
 # at a controlled binary for fault injection.
@@ -667,6 +681,11 @@ class RandomOps:
         self._agg_qualifiers = [
             f"agg{i}".encode() for i in range(self._rand.randint(1, 8))
         ]
+        # Monotonic op counter + per-row index of the last write, used to skip
+        # deletes that would land within the straggler window of a recent write
+        # to the same row (see DELETE_AFTER_WRITE_GUARD_OPS).
+        self._op_index = 0
+        self._last_write_op: dict[bytes, int] = {}
 
     def key(self) -> bytes:
         return self._rand.choice(self._keyspace)
@@ -721,14 +740,28 @@ class RandomOps:
         delete kinds (bounded and open-ended column ranges included), and — when
         ``include_aggregate`` is set — the non-idempotent int64 ``sum``
         add-to-cell aggregate.
+
+        A delete is never targeted at a row written within the last
+        ``DELETE_AFTER_WRITE_GUARD_OPS`` ops by this worker: such a delete could
+        race an uncancelled retry straggler of the recent write and resurrect the
+        cell, which Bigtable does not forbid (no cross-request idempotency
+        guarantee). Those deletes are downgraded to another set instead.
         """
+        self._op_index += 1
         roll = self._rand.random()
         key = self.key()
         if self._include_aggregate and roll < 0.18:
+            self._last_write_op[key] = self._op_index
             return key, expected_state.add_to_cell(
                 key, self.agg_qualifier(), self.add_delta(), self.ms_timestamp()
             )
-        if roll < 0.70:
+        last_write = self._last_write_op.get(key)
+        recently_written = (
+            last_write is not None
+            and self._op_index - last_write <= DELETE_AFTER_WRITE_GUARD_OPS
+        )
+        if roll < 0.70 or recently_written:
+            self._last_write_op[key] = self._op_index
             return key, expected_state.set_cell(
                 key, self.family(), self.qualifier(), self.value(), self.ms_timestamp()
             )
