@@ -48,7 +48,11 @@ __CROSS_SYNC_OUTPUT__ = "tests.system.data.accelerator.test_fuzz_correctness_aut
 class TestFuzzCorrectnessAsync(AcceleratorTestBase):
     """Randomized + targeted correctness of the real accelerator write/read path."""
 
-    NUM_OPS = 40
+    # High op count so the seeded differential sweep exercises a large,
+    # realistic mix of mutations against the real backend. This is a live,
+    # opt-in system test (skipped without real-Bigtable creds), not a CI unit
+    # test, so the RPC volume is intentional.
+    NUM_OPS = 100_000
 
     @CrossSync.convert
     async def _verify_key(self, accel_table, native_table, expected_state, key):
@@ -70,12 +74,13 @@ class TestFuzzCorrectnessAsync(AcceleratorTestBase):
     async def test_random_mutations_match_model_and_native(
         self, accel_table, native_table, janitor, seed
     ):
-        """Apply a random mix of set/delete mutations through the accelerator and
+        """Apply a random mix of set/add/delete mutations (including the
+        non-idempotent int64 aggregate add-to-cell) through the accelerator and
         continuously reconcile against the expected state and the native client."""
         # A unique key prefix per run keeps each expected state exact even if a
         # previous run's cleanup was incomplete (no cross-test row contamination).
         prefix = f"fuzz-{seed}-{uuid.uuid4().hex[:8]}-".encode()
-        ops = _harness.RandomOps(seed, key_prefix=prefix)
+        ops = _harness.RandomOps(seed, key_prefix=prefix, include_aggregate=True)
         expected_state = _harness.ExpectedState()
         touched: set[bytes] = set()
 

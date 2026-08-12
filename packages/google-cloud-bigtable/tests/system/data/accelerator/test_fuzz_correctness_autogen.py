@@ -42,7 +42,7 @@ from ._base_autogen import AcceleratorTestBase
 class TestFuzzCorrectness(AcceleratorTestBase):
     """Randomized + targeted correctness of the real accelerator write/read path."""
 
-    NUM_OPS = 40
+    NUM_OPS = 100000
 
     def _verify_key(self, accel_table, native_table, expected_state, key):
         """Assert accelerator read == expected == native read for one row."""
@@ -62,10 +62,11 @@ class TestFuzzCorrectness(AcceleratorTestBase):
     def test_random_mutations_match_model_and_native(
         self, accel_table, native_table, janitor, seed
     ):
-        """Apply a random mix of set/delete mutations through the accelerator and
+        """Apply a random mix of set/add/delete mutations (including the
+        non-idempotent int64 aggregate add-to-cell) through the accelerator and
         continuously reconcile against the expected state and the native client."""
         prefix = f"fuzz-{seed}-{uuid.uuid4().hex[:8]}-".encode()
-        ops = _harness.RandomOps(seed, key_prefix=prefix)
+        ops = _harness.RandomOps(seed, key_prefix=prefix, include_aggregate=True)
         expected_state = _harness.ExpectedState()
         touched: set[bytes] = set()
         for i in range(self.NUM_OPS):
