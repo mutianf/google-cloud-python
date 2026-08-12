@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Sequence
 
 from google.cloud.bigtable.data import (
+    AddToCell,
     DeleteAllFromFamily,
     DeleteAllFromRow,
     DeleteRangeFromColumn,
@@ -61,6 +62,12 @@ MS = 1000
 # Column families created by the shared system-test conftest.
 TEST_FAMILY = "test-family"
 TEST_FAMILY_2 = "test-family-2"
+# An int64 "sum" aggregate family (see ``column_family_config`` in the system
+# conftest). Only ``AddToCell`` may write to it; ``SetCell`` is server-rejected.
+# Cells read back as 8-byte big-endian signed int64 of the accumulated sum.
+TEST_AGGREGATE_FAMILY = "test-aggregate-family"
+# Width of an aggregate cell's value on read (int64, big-endian, signed).
+_AGGREGATE_VALUE_BYTES = 8
 
 # Env var honored by the real daemon wrapper (google/.../_accelerator/_daemon.py)
 # to override the binary location. We use it to point the *real* AcceleratorDaemon
@@ -80,12 +87,16 @@ class ExpectedState:
     """A minimal, deterministic model of Bigtable cell state.
 
     Only the semantics the accelerator routes through (``mutate_row`` +
-    ``read_row``) are modelled: set-cell and the three delete flavors, with
-    explicit millisecond-granular timestamps so the model is exact. Server-side
-    timestamps are intentionally out of scope here (they are non-deterministic;
-    tests that use them assert weaker invariants directly).
+    ``read_row``) are modelled: set-cell, add-to-cell (int64 ``sum`` aggregate),
+    and the three delete flavors, with explicit millisecond-granular timestamps
+    so the model is exact. Server-side timestamps are intentionally out of scope
+    here (they are non-deterministic; tests that use them assert weaker
+    invariants directly).
 
-    Storage: ``{row_key: {(family, qualifier): {timestamp_micros: value}}}``.
+    Storage: ``{row_key: {(family, qualifier): {timestamp_micros: value}}}``. For
+    ordinary families ``value`` is ``bytes``; for ``TEST_AGGREGATE_FAMILY`` it is
+    the accumulated ``int`` sum, encoded to 8-byte big-endian at read time so it
+    matches what Bigtable returns for an int64 aggregate cell.
     """
 
     def __init__(self) -> None:
@@ -103,6 +114,29 @@ class ExpectedState:
         col = self._rows.setdefault(row_key, {}).setdefault((family, qualifier), {})
         col[ts] = value
         return SetCell(family, qualifier, value, timestamp_micros=ts)
+
+    def add_to_cell(
+        self, row_key: bytes, qualifier: bytes, delta: int, ts: int
+    ) -> AddToCell:
+        """Accumulate ``delta`` into an int64 ``sum`` aggregate cell.
+
+        Aggregate cells live only in ``TEST_AGGREGATE_FAMILY``. Repeated adds at
+        the same (qualifier, timestamp) sum server-side — this mutation is *not*
+        idempotent, which is exactly why the model tracks the running total
+        rather than the last write. The stored value is an ``int``; it is encoded
+        to big-endian bytes in ``expected_cells``.
+        """
+        if ts % MS != 0:
+            raise ValueError(
+                "timestamps must be millisecond-granular (multiple of 1000)"
+            )
+        col = self._rows.setdefault(row_key, {}).setdefault(
+            (TEST_AGGREGATE_FAMILY, qualifier), {}
+        )
+        col[ts] = col.get(ts, 0) + delta
+        return AddToCell(
+            TEST_AGGREGATE_FAMILY, qualifier, delta, timestamp_micros=ts
+        )
 
     def delete_range_from_column(
         self,
@@ -146,7 +180,14 @@ class ExpectedState:
         out: list[Expected] = []
         for family, qualifier in sorted(row, key=lambda k: (k[0], k[1])):
             for ts in sorted(row[(family, qualifier)], reverse=True):
-                out.append((family, qualifier, ts, row[(family, qualifier)][ts]))
+                value = row[(family, qualifier)][ts]
+                if family == TEST_AGGREGATE_FAMILY:
+                    # Bigtable returns an int64 aggregate cell as 8 big-endian,
+                    # signed bytes; mirror that so the differential check matches.
+                    value = int(value).to_bytes(
+                        _AGGREGATE_VALUE_BYTES, "big", signed=True
+                    )
+                out.append((family, qualifier, ts, value))
         return out
 
     def row_is_empty(self, row_key: bytes) -> bool:
@@ -539,13 +580,35 @@ class RandomOps:
     contend on the same row, keeping the per-worker expected state exact.
     """
 
-    def __init__(self, seed: int, key_prefix: bytes = b"accel-"):
+    def __init__(
+        self,
+        seed: int,
+        key_prefix: bytes = b"accel-",
+        *,
+        include_aggregate: bool = False,
+    ):
         import random
 
         self._rand = random.Random(seed)
         self._prefix = key_prefix
         # A small, reused keyspace so reads hit written rows most of the time.
         self._keyspace = [key_prefix + f"{i:08d}".encode() for i in range(256)]
+        # Aggregate ops need ``TEST_AGGREGATE_FAMILY`` on the table; keep them
+        # opt-in so callers running against tables without that family (e.g. the
+        # self-managed stress table) are unaffected.
+        self._include_aggregate = include_aggregate
+        # Randomize the column cardinality per instance (seeded) so different
+        # runs spread cells across a variable number of qualifiers rather than a
+        # fixed handful of columns. The number of *families* is capped by the
+        # table schema: two ordinary families, plus the aggregate family when
+        # enabled.
+        self._families = [TEST_FAMILY, TEST_FAMILY_2]
+        self._qualifiers = [
+            f"q{i}".encode() for i in range(self._rand.randint(2, 16))
+        ]
+        self._agg_qualifiers = [
+            f"agg{i}".encode() for i in range(self._rand.randint(1, 8))
+        ]
 
     def key(self) -> bytes:
         return self._rand.choice(self._keyspace)
@@ -559,10 +622,30 @@ class RandomOps:
         return self._rand.randint(1, 2_000_000) * MS
 
     def family(self) -> str:
-        return self._rand.choice([TEST_FAMILY, TEST_FAMILY_2])
+        return self._rand.choice(self._families)
 
     def qualifier(self) -> bytes:
-        return self._rand.choice([b"q0", b"q1", b"q2", b"q3"])
+        return self._rand.choice(self._qualifiers)
+
+    def agg_qualifier(self) -> bytes:
+        return self._rand.choice(self._agg_qualifiers)
+
+    def add_delta(self) -> int:
+        # Bounded so even a long run of adds to one cell stays well inside int64.
+        return self._rand.randint(-(2**20), 2**20)
+
+    def _delete_target(self) -> tuple[str, bytes]:
+        """A coherent (family, qualifier) to delete from — sometimes the
+        aggregate family so aggregate cells are actually cleared, not just set."""
+        if self._include_aggregate and self._rand.random() < 0.30:
+            return TEST_AGGREGATE_FAMILY, self.agg_qualifier()
+        return self.family(), self.qualifier()
+
+    def _delete_family(self) -> str:
+        families = self._families + (
+            [TEST_AGGREGATE_FAMILY] if self._include_aggregate else []
+        )
+        return self._rand.choice(families)
 
     def build_set(self, expected_state: ExpectedState) -> tuple[bytes, SetCell]:
         key = self.key()
@@ -576,11 +659,17 @@ class RandomOps:
         expected state, and return ``(row_key, mutation)`` to send to the real
         table.
 
-        Covers all four accelerator-routed mutation flavors: set-cell and the
-        three delete kinds, including bounded and open-ended column ranges.
+        Covers every accelerator-routed mutation flavor: set-cell, the three
+        delete kinds (bounded and open-ended column ranges included), and — when
+        ``include_aggregate`` is set — the non-idempotent int64 ``sum``
+        add-to-cell aggregate.
         """
         roll = self._rand.random()
         key = self.key()
+        if self._include_aggregate and roll < 0.18:
+            return key, expected_state.add_to_cell(
+                key, self.agg_qualifier(), self.add_delta(), self.ms_timestamp()
+            )
         if roll < 0.70:
             return key, expected_state.set_cell(
                 key, self.family(), self.qualifier(), self.value(), self.ms_timestamp()
@@ -591,11 +680,10 @@ class RandomOps:
             b = self._rand.choice([None, self.ms_timestamp()])
             if a is not None and b is not None and a > b:
                 a, b = b, a
-            return key, expected_state.delete_range_from_column(
-                key, self.family(), self.qualifier(), a, b
-            )
+            fam, qual = self._delete_target()
+            return key, expected_state.delete_range_from_column(key, fam, qual, a, b)
         if roll < 0.92:
-            return key, expected_state.delete_from_family(key, self.family())
+            return key, expected_state.delete_from_family(key, self._delete_family())
         return key, expected_state.delete_from_row(key)
 
     def read_query(self, key: bytes) -> ReadRowsQuery:
