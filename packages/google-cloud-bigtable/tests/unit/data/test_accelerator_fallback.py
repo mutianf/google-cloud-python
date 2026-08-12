@@ -51,11 +51,11 @@ def _aio_error(code: grpc.StatusCode, details: str = "boom") -> grpc.aio.AioRpcE
 def _dead_daemon() -> AcceleratorDaemon:
     """A real, never-started daemon: ``is_running`` is ``False``.
 
-    ``__init__`` only resolves the binary path (it does not spawn or validate the
-    process), so passing an explicit path yields a genuine wrapper in the
-    "process not running" state without needing a bundled binary.
+    ``__init__`` validates the binary path is a regular file but never spawns it,
+    so pointing it at any existing file (this test module) yields a genuine
+    wrapper in the "process not running" state without needing a bundled binary.
     """
-    return AcceleratorDaemon(binary_path="/nonexistent/accelerator-binary")
+    return AcceleratorDaemon(binary_path=__file__)
 
 
 # ---------------------------------------------------------------------------
