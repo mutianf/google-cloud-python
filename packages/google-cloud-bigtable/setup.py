@@ -100,6 +100,13 @@ setuptools.setup(
     python_requires=">=3.10",
     install_requires=dependencies,
     extras_require=extras,
+    entry_points={
+        "console_scripts": [
+            # Standalone YCSB-style benchmark driver for the data (V3) client,
+            # bundled in the wheel so it runs without a source checkout.
+            "bigtable-ycsb = google.cloud.bigtable.data._benchmarks.ycsb_perf:main",
+        ],
+    },
     include_package_data=True,
     zip_safe=False,
 )
