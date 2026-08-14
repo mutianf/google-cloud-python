@@ -37,7 +37,7 @@ import os
 import stat
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Sequence
 
 from google.cloud.bigtable.data import (
@@ -538,33 +538,57 @@ class TokenBucket:
         self._next_at = max(self._next_at + self._interval, now)
 
 
-@dataclass
 class LatencyStats:
-    """Accumulates latencies (seconds) and computes percentiles on demand."""
+    """Accumulates latency percentiles with bounded memory.
 
-    samples: list[float] = field(default_factory=list)
+    Count, sum, and max are tracked exactly; percentiles come from a
+    fixed-capacity reservoir sample (Vitter's Algorithm R). Retaining every
+    latency (the previous behavior) made this list dominate driver RSS on a
+    multi-hour soak recording tens of millions of ops — the reservoir keeps a
+    constant footprint while staying exact for any run under ``max_samples``.
+    """
+
+    def __init__(self, max_samples: int = 100_000) -> None:
+        import random
+
+        self._max_samples = max_samples
+        self._reservoir: list[float] = []
+        # Seeded so a run is reproducible; the reservoir only feeds percentiles.
+        self._rand = random.Random(0)
+        self.count = 0
+        self._sum = 0.0
+        self._max = 0.0
 
     def record(self, seconds: float) -> None:
-        self.samples.append(seconds)
+        self.count += 1
+        self._sum += seconds
+        if seconds > self._max:
+            self._max = seconds
+        if len(self._reservoir) < self._max_samples:
+            self._reservoir.append(seconds)
+        else:
+            j = self._rand.randint(0, self.count - 1)
+            if j < self._max_samples:
+                self._reservoir[j] = seconds
 
     def percentile(self, pct: float) -> float:
-        if not self.samples:
+        if not self._reservoir:
             return float("nan")
-        ordered = sorted(self.samples)
+        ordered = sorted(self._reservoir)
         k = max(
             0, min(len(ordered) - 1, int(round((pct / 100.0) * (len(ordered) - 1))))
         )
         return ordered[k]
 
     def summary_ms(self) -> dict[str, float]:
-        if not self.samples:
+        if not self.count:
             return {"count": 0}
         return {
-            "count": len(self.samples),
+            "count": self.count,
             "p50_ms": self.percentile(50) * 1000,
             "p99_ms": self.percentile(99) * 1000,
-            "max_ms": max(self.samples) * 1000,
-            "mean_ms": (sum(self.samples) / len(self.samples)) * 1000,
+            "max_ms": self._max * 1000,
+            "mean_ms": (self._sum / self.count) * 1000,
         }
 
 
