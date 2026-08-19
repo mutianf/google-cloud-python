@@ -1,0 +1,5 @@
+# The accelerator daemon binary (and the setup.py-generated build_info.json) is
+# staged here per-wheel at build time by the external build script; the source
+# tree only ships an empty directory.
+*
+!.gitignore
