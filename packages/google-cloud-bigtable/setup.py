@@ -14,10 +14,109 @@
 # limitations under the License.
 #
 import io
+import json
 import os
 import re
 
 import setuptools  # type: ignore
+
+
+class _BinaryDistribution(setuptools.Distribution):
+    """Forces bdist_wheel to emit a platform-tagged wheel instead of
+    py3-none-any. The wheel ships the prebuilt accelerator daemon binary
+    (google/cloud/bigtable/data/_accelerator/bin/accelerator) when present.
+    Use --plat-name on bdist_wheel to set the actual platform tag.
+    """
+
+    def has_ext_modules(self):  # noqa: D401 - setuptools API
+        return True
+
+
+# Name of the provenance file dropped next to the bundled daemon so each wheel
+# records which daemon binary it shipped (see _BDistWheel.run below).
+_BUILD_INFO_NAME = "build_info.json"
+_ACCEL_BIN_RELPATH = "google/cloud/bigtable/data/_accelerator/bin"
+
+
+# The bundled binary is a standalone executable, not a CPython extension
+# module — so the wheel's Python+ABI tag should be (py3, none), not
+# (cp311, cp311). One linux/amd64 wheel works for any Python 3.x interpreter.
+try:
+    from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
+
+    class _BDistWheel(_bdist_wheel):
+        # Configuration hooks an external build script passes in via
+        #   python -m build \
+        #     --config-setting=--build-option=--wheel-version=<pep440> \
+        #     --config-setting=--build-option=--go-binary-source=<url> \
+        #     --config-setting=--build-option=--go-binary-version=<ref> \
+        #     --config-setting=--build-option=--plat-name=<tag>
+        # The external script fetches and stages the prebuilt daemon into
+        # bin/accelerator[.exe] before invoking the build; setup.py only bundles
+        # it. --wheel-version overrides the version stamped on the wheel;
+        # --go-binary-source/--go-binary-version are recorded as build
+        # provenance (not used to fetch or build anything here).
+        user_options = _bdist_wheel.user_options + [
+            (
+                "wheel-version=",
+                None,
+                "PEP 440 version to stamp on the wheel "
+                "(default: __version__ from gapic_version.py).",
+            ),
+            (
+                "go-binary-source=",
+                None,
+                "Source the bundled accelerator daemon was fetched from "
+                "(recorded as build provenance).",
+            ),
+            (
+                "go-binary-version=",
+                None,
+                "Version of the bundled accelerator daemon "
+                "(recorded as build provenance).",
+            ),
+        ]
+
+        def initialize_options(self):
+            super().initialize_options()
+            self.wheel_version = None
+            self.go_binary_source = None
+            self.go_binary_version = None
+
+        def finalize_options(self):
+            # Apply the version override before super() reads metadata to build
+            # the dist-info and the wheel filename.
+            if self.wheel_version:
+                self.distribution.metadata.version = self.wheel_version
+            super().finalize_options()
+            self.root_is_pure = False
+
+        def get_tag(self):
+            _python, _abi, plat = super().get_tag()
+            return ("py3", "none", plat)
+
+        def run(self):
+            # Write provenance before build_py copies package data so it lands
+            # in the wheel alongside the daemon binary.
+            self._write_build_info()
+            super().run()
+
+        def _write_build_info(self):
+            here = os.path.abspath(os.path.dirname(__file__))
+            bin_dir = os.path.join(here, *_ACCEL_BIN_RELPATH.split("/"))
+            os.makedirs(bin_dir, exist_ok=True)
+            info = {
+                "wheel_version": self.distribution.metadata.version,
+                "go_binary_source": self.go_binary_source or "",
+                "go_binary_version": self.go_binary_version or "",
+            }
+            with open(os.path.join(bin_dir, _BUILD_INFO_NAME), "w") as fp:
+                json.dump(info, fp, indent=2, sort_keys=True)
+                fp.write("\n")
+
+    _cmdclass = {"bdist_wheel": _BDistWheel}
+except ImportError:
+    _cmdclass = {}
 
 package_root = os.path.abspath(os.path.dirname(__file__))
 
@@ -29,12 +128,11 @@ description = "Google Cloud Bigtable API client library"
 version = None
 
 with open(os.path.join(package_root, "google/cloud/bigtable/gapic_version.py")) as fp:
-    version_candidates = re.findall(
-        r"(?<=\")\d+\.\d+\.\d+[^\"\s]*(?=\")",
-        fp.read(),
-    )
-    assert len(version_candidates) == 1
-    version = version_candidates[0]
+    # Accept any PEP 440 version string (pre-releases, local segments, etc.),
+    # not just bare X.Y.Z.
+    match = re.search(r'__version__\s*=\s*"([^"]+)"', fp.read())
+    assert match, "could not find __version__ in gapic_version.py"
+    version = match.group(1)
 
 if version[0] == "0":
     release_status = "Development Status :: 4 - Beta"
@@ -92,10 +190,10 @@ setuptools.setup(
         "Programming Language :: Python :: 3.12",
         "Programming Language :: Python :: 3.13",
         "Programming Language :: Python :: 3.14",
-        "Operating System :: OS Independent",
+        "Operating System :: POSIX :: Linux",
         "Topic :: Internet",
     ],
-    platforms="Posix; MacOS X; Windows",
+    platforms="Linux",
     packages=packages,
     python_requires=">=3.10",
     install_requires=dependencies,
@@ -109,4 +207,6 @@ setuptools.setup(
     },
     include_package_data=True,
     zip_safe=False,
+    distclass=_BinaryDistribution,
+    cmdclass=_cmdclass,
 )
