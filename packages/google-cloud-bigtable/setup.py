@@ -171,16 +171,24 @@ packages = [
 ]
 
 # The accelerator daemon binary ships in a `bin/` directory whose name is a
-# valid Python identifier. `find_namespace_packages()` only discovers it when
-# the directory exists on disk at build time, but `bin/` is empty in a clean
-# checkout and the binary is staged by an external build script. Depending on
-# the build tool (isolated sdist->wheel, git export, staging order), discovery
-# may miss `bin` while MANIFEST.in still bundles the binary -- setuptools then
-# rejects the build as an ambiguous "importable package absent from packages"
-# configuration. Declare the package explicitly so the config is deterministic
-# regardless of when the binary is staged.
+# valid Python identifier. When an external build script stages the binary
+# there, `find_namespace_packages()` normally discovers it -- but depending on
+# the build tool (isolated sdist->wheel, git export, staging order) discovery
+# can miss `bin` while MANIFEST.in still bundles the binary, and setuptools
+# then rejects the build as an ambiguous "importable package absent from
+# packages" configuration. Declaring it explicitly makes that deterministic.
+#
+# But only declare it when the directory actually exists: a pure build with no
+# staged binary (e.g. the base wheel, or a checkout that doesn't carry the
+# placeholder dir) has no `bin/`, and naming a nonexistent package directory
+# makes setuptools fail with "package directory ... does not exist". Gating on
+# existence satisfies both cases -- binary staged => dir present => declared =>
+# no ambiguity; no binary => dir absent => omitted => nothing to bundle anyway.
 _accelerator_bin_pkg = "google.cloud.bigtable.data._accelerator.bin"
-if _accelerator_bin_pkg not in packages:
+_accelerator_bin_dir = os.path.join(
+    package_root, *"google/cloud/bigtable/data/_accelerator/bin".split("/")
+)
+if os.path.isdir(_accelerator_bin_dir) and _accelerator_bin_pkg not in packages:
     packages.append(_accelerator_bin_pkg)
 
 setuptools.setup(
