@@ -76,18 +76,25 @@ _AGGREGATE_VALUE_BYTES = 8
 # recent op sequence that produced a divergent cell.
 OP_HISTORY_PER_KEY = 256
 
-# Straggler guard for the delete-after-write race. A MutateRow the daemon
-# retried (e.g. after a spurious session-heartbeat miss) can leave its *original*
-# attempt uncancelled on the wire; that attempt may commit at the backend AFTER a
-# later, separate request the client already saw succeed. Bigtable does not
-# guarantee idempotency across two requests, so a delete issued shortly after a
-# set to the same row can race such a straggler and "resurrect" the set cell.
-# This is acceptable per the service contract, so the generator does not target a
-# delete at a row written within the last DELETE_AFTER_WRITE_GUARD_OPS operations
-# by the same worker (such a delete is downgraded to another set). The window is
-# in op units (kept deterministic for the seeded fuzz test) and is generous
-# relative to the observed straggler lag (~24 ops) while still leaving plenty of
-# deletes against older, populated rows. See project_accelerator_canary_drift.
+# Straggler guard for the retry-straggler race, in BOTH directions. A MutateRow
+# the daemon retried (e.g. after a spurious session-heartbeat miss) can leave its
+# *original* attempt uncancelled on the wire; that attempt may commit at the
+# backend AFTER a later, separate request the client already saw succeed. Bigtable
+# does not guarantee idempotency across two requests, so two opposite-kind
+# mutations to the same row issued within a straggler window of each other can be
+# reordered at the backend relative to the client's view:
+#   * delete-after-write: a delete racing a straggler of a recent *write*
+#     "resurrects" the set cell (Bigtable ends up with a cell the model deleted);
+#   * write-after-delete: a write racing a straggler of a recent *delete* gets
+#     silently wiped (Bigtable ends up missing a cell the model set) — the mirror
+#     case, confirmed as the only residual drift over a 72h/269M-op soak.
+# Both are acceptable per the service contract, so the generator never targets a
+# delete at a row written, nor a write at a row deleted, within the last
+# DELETE_AFTER_WRITE_GUARD_OPS operations by the same worker (the offending op is
+# downgraded to the opposite kind). The window is in op units (kept deterministic
+# for the seeded fuzz test) and is generous relative to the observed straggler lag
+# (~24 ops) while still leaving plenty of both writes and deletes against older
+# rows. See project_accelerator_canary_drift.
 DELETE_AFTER_WRITE_GUARD_OPS = 128
 
 # Env var honored by the real daemon wrapper (google/.../_accelerator/_daemon.py)
@@ -681,11 +688,14 @@ class RandomOps:
         self._agg_qualifiers = [
             f"agg{i}".encode() for i in range(self._rand.randint(1, 8))
         ]
-        # Monotonic op counter + per-row index of the last write, used to skip
-        # deletes that would land within the straggler window of a recent write
-        # to the same row (see DELETE_AFTER_WRITE_GUARD_OPS).
+        # Monotonic op counter + per-row index of the last write and the last
+        # delete, used to skip a delete that would land within the straggler
+        # window of a recent write to the same row and, symmetrically, a write
+        # that would land within the window of a recent delete (see
+        # DELETE_AFTER_WRITE_GUARD_OPS).
         self._op_index = 0
         self._last_write_op: dict[bytes, int] = {}
+        self._last_delete_op: dict[bytes, int] = {}
 
     def key(self) -> bytes:
         return self._rand.choice(self._keyspace)
@@ -742,29 +752,48 @@ class RandomOps:
         add-to-cell aggregate.
 
         A delete is never targeted at a row written within the last
-        ``DELETE_AFTER_WRITE_GUARD_OPS`` ops by this worker: such a delete could
-        race an uncancelled retry straggler of the recent write and resurrect the
-        cell, which Bigtable does not forbid (no cross-request idempotency
-        guarantee). Those deletes are downgraded to another set instead.
+        ``DELETE_AFTER_WRITE_GUARD_OPS`` ops by this worker, nor a write at a row
+        deleted within that window: either op could race an uncancelled retry
+        straggler of the recent opposite-kind mutation and resurrect (delete after
+        write) or wipe (write after delete) a cell, which Bigtable does not forbid
+        (no cross-request idempotency guarantee). The offending op is downgraded
+        to the opposite kind instead.
         """
         self._op_index += 1
         roll = self._rand.random()
         key = self.key()
+        last_write = self._last_write_op.get(key)
+        last_delete = self._last_delete_op.get(key)
+        recently_written = (
+            last_write is not None
+            and self._op_index - last_write <= DELETE_AFTER_WRITE_GUARD_OPS
+        )
+        recently_deleted = (
+            last_delete is not None
+            and self._op_index - last_delete <= DELETE_AFTER_WRITE_GUARD_OPS
+        )
+        # Write-after-delete guard (mirror): any write (set-cell or the aggregate
+        # add) landing within the straggler window of a recent delete to this row
+        # can be silently wiped by that delete's late straggler. Downgrade it to a
+        # delete. A row cannot be both recently_written and recently_deleted — the
+        # delete-after-write guard below converts the intervening delete to a set,
+        # so ``last_delete`` never refreshes during a write phase (and vice versa)
+        # — hence the two guards never fight.
+        if recently_deleted and not recently_written:
+            self._last_delete_op[key] = self._op_index
+            return key, expected_state.delete_from_row(key)
         if self._include_aggregate and roll < 0.18:
             self._last_write_op[key] = self._op_index
             return key, expected_state.add_to_cell(
                 key, self.agg_qualifier(), self.add_delta(), self.ms_timestamp()
             )
-        last_write = self._last_write_op.get(key)
-        recently_written = (
-            last_write is not None
-            and self._op_index - last_write <= DELETE_AFTER_WRITE_GUARD_OPS
-        )
+        # Delete-after-write guard: downgrade a delete near a recent write to a set.
         if roll < 0.70 or recently_written:
             self._last_write_op[key] = self._op_index
             return key, expected_state.set_cell(
                 key, self.family(), self.qualifier(), self.value(), self.ms_timestamp()
             )
+        self._last_delete_op[key] = self._op_index
         if roll < 0.82:
             # Bounded or half-open column range; keep start <= end when both set.
             a = self._rand.choice([None, self.ms_timestamp()])
