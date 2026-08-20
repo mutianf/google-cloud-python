@@ -170,6 +170,19 @@ packages = [
     if package.startswith("google")
 ]
 
+# The accelerator daemon binary ships in a `bin/` directory whose name is a
+# valid Python identifier. `find_namespace_packages()` only discovers it when
+# the directory exists on disk at build time, but `bin/` is empty in a clean
+# checkout and the binary is staged by an external build script. Depending on
+# the build tool (isolated sdist->wheel, git export, staging order), discovery
+# may miss `bin` while MANIFEST.in still bundles the binary -- setuptools then
+# rejects the build as an ambiguous "importable package absent from packages"
+# configuration. Declare the package explicitly so the config is deterministic
+# regardless of when the binary is staged.
+_accelerator_bin_pkg = "google.cloud.bigtable.data._accelerator.bin"
+if _accelerator_bin_pkg not in packages:
+    packages.append(_accelerator_bin_pkg)
+
 setuptools.setup(
     name=name,
     version=version,
@@ -195,6 +208,15 @@ setuptools.setup(
     ],
     platforms="Linux",
     packages=packages,
+    package_data={
+        # Bundle the prebuilt accelerator daemon (staged at build time) and its
+        # provenance manifest. Empty when no binary is staged (pure sdist).
+        _accelerator_bin_pkg: [
+            "accelerator",
+            "accelerator.exe",
+            "build_info.json",
+        ],
+    },
     python_requires=">=3.10",
     install_requires=dependencies,
     extras_require=extras,
