@@ -104,7 +104,18 @@ try:
         def _write_build_info(self):
             here = os.path.abspath(os.path.dirname(__file__))
             bin_dir = os.path.join(here, *_ACCEL_BIN_RELPATH.split("/"))
-            os.makedirs(bin_dir, exist_ok=True)
+            # Only stamp provenance when a daemon binary is actually staged for
+            # bundling. `packages` is computed at import time (before this runs);
+            # creating build_info.json in an otherwise-empty/absent bin/ would
+            # materialize a data file in a package directory that wasn't declared
+            # then, which setuptools rejects as an ambiguous configuration. A
+            # provenance record for a binary we aren't shipping is meaningless
+            # anyway.
+            if not any(
+                os.path.isfile(os.path.join(bin_dir, name))
+                for name in ("accelerator", "accelerator.exe")
+            ):
+                return
             info = {
                 "wheel_version": self.distribution.metadata.version,
                 "go_binary_source": self.go_binary_source or "",
