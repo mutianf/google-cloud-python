@@ -40,7 +40,9 @@ from typing import Any, Mapping, Sequence
 _BIN_ENV_VAR = "BIGTABLE_ACCELERATOR_BIN"
 
 # Wheels ship the binary at this path relative to the `_accelerator/` package.
+# Windows wheels bundle it with a `.exe` suffix (see `_default_binary_path`).
 _DEFAULT_BIN_RELATIVE_PATH = "bin/accelerator"
+_WINDOWS_BIN_SUFFIX = ".exe"
 
 # The daemon writes the principal it resolved to this file in its tempdir
 # (alongside the socket) before binding, so the client can verify it matches
@@ -55,6 +57,17 @@ _DEFAULT_STARTUP_TIMEOUT = 10.0
 _STDIN_GRACE_SECONDS = 2.0
 _SIGTERM_GRACE_SECONDS = 2.0
 _SIGKILL_GRACE_SECONDS = 2.0
+
+
+def _default_binary_path() -> str | None:
+    base = os.path.join(os.path.dirname(__file__), _DEFAULT_BIN_RELATIVE_PATH)
+    # Windows wheels bundle the daemon as `accelerator.exe`; every other
+    # platform ships it without a suffix.
+    candidates = (base + _WINDOWS_BIN_SUFFIX, base) if os.name == "nt" else (base,)
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return None
 
 
 def _resolve_binary_path(explicit_path: str | None = None) -> str:
@@ -79,8 +92,8 @@ def _resolve_binary_path(explicit_path: str | None = None) -> str:
                 f"{_BIN_ENV_VAR}={override!r} does not point at a regular file"
             )
         return override
-    bundled = os.path.join(os.path.dirname(__file__), _DEFAULT_BIN_RELATIVE_PATH)
-    if not os.path.isfile(bundled):
+    bundled = _default_binary_path()
+    if bundled is None:
         raise FileNotFoundError(
             "No accelerator binary found. Set the "
             f"{_BIN_ENV_VAR} env var to a daemon binary path, or install a "
