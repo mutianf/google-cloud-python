@@ -23,6 +23,7 @@ tearing the process down. It does NOT speak gRPC; that's the
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 import secrets
@@ -49,6 +50,15 @@ _WINDOWS_BIN_SUFFIX = ".exe"
 # its own locally-resolved identity before routing any RPC.
 _IDENTITY_FILENAME = "identity.json"
 
+# Prefix for the per-daemon tempdir (created by ``tempfile.mkdtemp``) that holds
+# the socket, identity, and log. Used both when creating our own and to scope
+# the startup sweep of leftovers.
+_TEMPDIR_PREFIX = "bt-accel-"
+
+# Names of the files a live daemon keeps inside its tempdir.
+_SOCKET_FILENAME = "sock"
+_LOG_FILENAME = "daemon.log"
+
 # How long to wait for the daemon to start listening on its UDS before giving
 # up at startup.
 _DEFAULT_STARTUP_TIMEOUT = 10.0
@@ -57,6 +67,11 @@ _DEFAULT_STARTUP_TIMEOUT = 10.0
 _STDIN_GRACE_SECONDS = 2.0
 _SIGTERM_GRACE_SECONDS = 2.0
 _SIGKILL_GRACE_SECONDS = 2.0
+
+# A freshly-created tempdir may not have bound its socket yet. Never sweep one
+# younger than this, so a daemon another client is mid-way through starting is
+# never mistaken for a stale leftover and reaped out from under it.
+_STALE_SWEEP_MIN_AGE_SECONDS = 60.0
 
 
 def _default_binary_path() -> str | None:
@@ -100,6 +115,53 @@ def _resolve_binary_path(explicit_path: str | None = None) -> str:
             "wheel that bundles the binary."
         )
     return bundled
+
+
+def _socket_is_live(uds_path: str) -> bool:
+    """Return True if something is currently accepting connections on the UDS."""
+    if not os.path.exists(uds_path):
+        return False
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+        probe.settimeout(0.25)
+        try:
+            probe.connect(uds_path)
+            return True
+        except OSError:
+            return False
+
+
+def _sweep_stale_tempdirs() -> None:
+    """Best-effort reaping of leftover daemon tempdirs at startup.
+
+    A clean ``close()`` removes its own tempdir, but a crash or ``SIGKILL``
+    leaves the socket and log behind. We reap those on the next start.
+
+    Rather than treating any ``bt-accel-*`` directory as ours, we key off the
+    ``daemon.log`` marker file we write inside each one: a directory is a
+    candidate only if it actually contains that log. This avoids deleting an
+    unrelated directory that merely shares the tempdir prefix. A candidate is
+    removed only when its socket no longer accepts connections *and* it is old
+    enough that a daemon still mid-startup would already have bound (or died).
+
+    All failures are swallowed — sweeping is opportunistic and must never break
+    startup.
+    """
+    root = tempfile.gettempdir()
+    try:
+        logs = glob.glob(os.path.join(root, _TEMPDIR_PREFIX + "*", _LOG_FILENAME))
+    except OSError:
+        return
+    now = time.time()
+    for log_path in logs:
+        path = os.path.dirname(log_path)
+        try:
+            if now - os.path.getmtime(log_path) < _STALE_SWEEP_MIN_AGE_SECONDS:
+                continue
+            if _socket_is_live(os.path.join(path, _SOCKET_FILENAME)):
+                continue
+        except OSError:
+            continue
+        shutil.rmtree(path, ignore_errors=True)
 
 
 class AcceleratorDaemon:
@@ -204,8 +266,11 @@ class AcceleratorDaemon:
         """
         if self._proc is not None:
             raise RuntimeError("AcceleratorDaemon.start() called twice")
-        self._tempdir = tempfile.mkdtemp(prefix="bt-accel-")
-        self._uds_path = os.path.join(self._tempdir, "sock")
+        # Reap tempdirs leaked by daemons from prior runs that crashed or were
+        # killed before close() could clean up after them.
+        _sweep_stale_tempdirs()
+        self._tempdir = tempfile.mkdtemp(prefix=_TEMPDIR_PREFIX)
+        self._uds_path = os.path.join(self._tempdir, _SOCKET_FILENAME)
         # Redirect the daemon's stdout/stderr to a log file rather than
         # subprocess.PIPE. Nothing drains those pipes for the daemon's
         # lifetime, so a PIPE's fixed OS buffer would eventually fill and
@@ -214,7 +279,7 @@ class AcceleratorDaemon:
         # tempdir so it's cleaned up with everything else in close(). stdin
         # stays a PIPE — closing it is how close() signals the daemon to shut
         # down.
-        self._log_path = os.path.join(self._tempdir, "daemon.log")
+        self._log_path = os.path.join(self._tempdir, _LOG_FILENAME)
         # The log file handle only needs to live long enough for Popen to dup
         # it into the child, so it stays local to start() rather than being an
         # attribute. Startup failures read the tail back from the path.
@@ -339,14 +404,8 @@ class AcceleratorDaemon:
                     "Accelerator daemon exited during startup "
                     f"(exit code {exit_code}). log: {log_tail!r}"
                 )
-            if os.path.exists(self._uds_path):
-                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
-                    probe.settimeout(0.25)
-                    try:
-                        probe.connect(self._uds_path)
-                        return
-                    except (ConnectionRefusedError, FileNotFoundError, OSError):
-                        pass
+            if _socket_is_live(self._uds_path):
+                return
             time.sleep(0.05)
         log_tail = self._read_log_tail()
         raise RuntimeError(
