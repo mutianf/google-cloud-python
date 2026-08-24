@@ -314,7 +314,7 @@ class BigtableDataClient(ClientWithProject):
                     credentials_file
                 )
         self._accelerator_flags += [
-            "--caller-user-agent",
+            "--user-agent",
             f"python-v{google.cloud.bigtable.__version__}",
         ]
 

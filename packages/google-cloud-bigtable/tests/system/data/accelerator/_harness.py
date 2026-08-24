@@ -37,6 +37,7 @@ import os
 import stat
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Sequence
 
@@ -68,6 +69,12 @@ TEST_FAMILY_2 = "test-family-2"
 TEST_AGGREGATE_FAMILY = "test-aggregate-family"
 # Width of an aggregate cell's value on read (int64, big-endian, signed).
 _AGGREGATE_VALUE_BYTES = 8
+
+# How many recent mutations to retain per row key for post-mortem diagnosis of a
+# canary mismatch. Bounded so a multi-hour soak (256 keys/worker, thousands of
+# ops each) does not grow the model without limit; deep enough to reconstruct the
+# recent op sequence that produced a divergent cell.
+OP_HISTORY_PER_KEY = 256
 
 # Env var honored by the real daemon wrapper (google/.../_accelerator/_daemon.py)
 # to override the binary location. We use it to point the *real* AcceleratorDaemon
@@ -101,6 +108,23 @@ class ExpectedState:
 
     def __init__(self) -> None:
         self._rows: dict[bytes, dict[tuple[str, bytes], dict[int, bytes]]] = {}
+        # Per-key, bounded op history for post-mortem diagnosis of a canary
+        # mismatch (see OP_HISTORY_PER_KEY). ``_seq`` is a monotonic op index so
+        # the recorded order matches the order the worker applied mutations.
+        self._history: dict[bytes, deque[str]] = {}
+        self._seq = 0
+
+    def _record(self, row_key: bytes, desc: str) -> None:
+        self._seq += 1
+        hist = self._history.get(row_key)
+        if hist is None:
+            hist = self._history.setdefault(row_key, deque(maxlen=OP_HISTORY_PER_KEY))
+        hist.append(f"#{self._seq} {desc}")
+
+    def history(self, row_key: bytes) -> list[str]:
+        """Recent mutations applied to ``row_key``, oldest first (bounded to the
+        last ``OP_HISTORY_PER_KEY`` ops)."""
+        return list(self._history.get(row_key, ()))
 
     # -- mutation builders: update the model and return the real Mutation ----
 
@@ -113,6 +137,10 @@ class ExpectedState:
             )
         col = self._rows.setdefault(row_key, {}).setdefault((family, qualifier), {})
         col[ts] = value
+        self._record(
+            row_key,
+            f"set ({family},{qualifier!r})@{ts} val[{len(value)}]={value[:8].hex()}",
+        )
         return SetCell(family, qualifier, value, timestamp_micros=ts)
 
     def add_to_cell(
@@ -155,6 +183,10 @@ class ExpectedState:
                     del col[ts]
             if not col:
                 self._rows[row_key].pop((family, qualifier), None)
+        self._record(
+            row_key,
+            f"del_col ({family},{qualifier!r}) start={start} end={end}",
+        )
         return DeleteRangeFromColumn(family, qualifier, start, end)
 
     def delete_from_family(self, row_key: bytes, family: str) -> DeleteAllFromFamily:
@@ -162,10 +194,12 @@ class ExpectedState:
         if row is not None:
             for key in [k for k in row if k[0] == family]:
                 del row[key]
+        self._record(row_key, f"del_fam {family}")
         return DeleteAllFromFamily(family)
 
     def delete_from_row(self, row_key: bytes) -> DeleteAllFromRow:
         self._rows.pop(row_key, None)
+        self._record(row_key, "del_row")
         return DeleteAllFromRow()
 
     # -- expectation -------------------------------------------------------
