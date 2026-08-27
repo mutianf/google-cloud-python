@@ -63,7 +63,15 @@ from dataclasses import dataclass
 
 from google.cloud.bigtable.data import BigtableDataClient, BigtableDataClientAsync
 
-from . import _harness
+# This driver supports two invocations: as a package module
+# (``python -m tests.system.data.accelerator.stress``) and as a plain script
+# (``python tests/system/data/accelerator/stress.py``). The latter gives the
+# module no parent package, so fall back to importing ``_harness`` from the
+# script's own directory (already on ``sys.path`` as ``sys.path[0]``).
+if __package__:
+    from . import _harness
+else:  # pragma: no cover - exercised only when run as a standalone script
+    import _harness
 
 # ---------------------------------------------------------------------------
 # Configuration
