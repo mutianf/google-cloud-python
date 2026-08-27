@@ -32,6 +32,7 @@ tests, and the standalone stress driver. The pieces are:
 
 from __future__ import annotations
 
+import gc
 import glob
 import os
 import stat
@@ -474,22 +475,51 @@ class ProcessIntrospector:
         )
 
     def assert_no_leaks(
-        self, before: LeakSnapshot, *, fd_slack: int = 8, label: str = ""
+        self,
+        before: LeakSnapshot,
+        *,
+        fd_slack: int = 8,
+        label: str = "",
+        settle_timeout: float = 5.0,
     ) -> None:
         after = self.snapshot()
+        prefix = f"[{label}] " if label else ""
+
+        # Subprocess and tempdir leaks are definitive the instant close() returns
+        # (the wrapper reaps the daemon and rmtree's its dir synchronously), so
+        # these are asserted against the immediate snapshot.
         leaked_children = after.child_pids - before.child_pids
         leaked_dirs = after.tempdirs - before.tempdirs
-        prefix = f"[{label}] " if label else ""
         assert not leaked_children, (
             f"{prefix}leaked {len(leaked_children)} daemon subprocess(es): "
             f"{sorted(leaked_children)}"
         )
         assert not leaked_dirs, f"{prefix}leaked accel tempdirs: {sorted(leaked_dirs)}"
-        if before.num_fds >= 0 and after.num_fds >= 0:
-            assert after.num_fds <= before.num_fds + fd_slack, (
-                f"{prefix}fd count grew from {before.num_fds} to {after.num_fds} "
-                f"(slack {fd_slack})"
-            )
+
+        # File descriptors, unlike the above, are released *lazily*: closing a
+        # grpc(.aio) channel tears down its epoll/eventfd/resolver-socket fds on a
+        # background path, so an fd count sampled immediately after a burst of
+        # create/close cycles catches descriptors that are mid-teardown rather
+        # than truly leaked (the same async-grpc high-water seen in the soak
+        # suite, where native and accelerator track identically). Force a GC and
+        # take the *minimum* fd count over a short settle window: a transient
+        # high-water drains back toward the baseline within the window and
+        # passes, while a genuine per-cycle leak keeps every cycle's fds open so
+        # the minimum stays high and still trips the assertion.
+        if before.num_fds < 0 or after.num_fds < 0:
+            return
+        gc.collect()
+        min_fds = after.num_fds
+        deadline = time.monotonic() + settle_timeout
+        while min_fds > before.num_fds + fd_slack and time.monotonic() < deadline:
+            time.sleep(0.1)
+            cur = self.snapshot().num_fds
+            if cur >= 0:
+                min_fds = min(min_fds, cur)
+        assert min_fds <= before.num_fds + fd_slack, (
+            f"{prefix}fd count grew from {before.num_fds} to {min_fds} "
+            f"(slack {fd_slack}) and did not drain within {settle_timeout:g}s"
+        )
 
 
 def call_with_timeout(fn: Callable[[], Any], timeout: float) -> Any:
