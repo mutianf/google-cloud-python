@@ -75,6 +75,9 @@ from google.cloud.bigtable.data._metrics import (
 from google.cloud.bigtable.data._sync_autogen._accelerator_client import (
     _AcceleratorClient as AcceleratorClientType,
 )
+from google.cloud.bigtable.data._sync_autogen._accelerator_health import (
+    _AcceleratorHealthMonitor as AcceleratorHealthMonitorType,
+)
 from google.cloud.bigtable.data._sync_autogen._swappable_channel import (
     SwappableChannel as SwappableChannelType,
 )
@@ -1024,6 +1027,7 @@ class _DataApiTarget(abc.ABC):
             ) from e
         self._accelerator_daemon: AcceleratorDaemon | None = None
         self._accelerator_client: AcceleratorClientType | None = None
+        self._accelerator_health: AcceleratorHealthMonitorType | None = None
         self._accelerator_breaker = AcceleratorBreaker()
         if self.client._use_accelerator is not False:
             self._maybe_start_accelerator(explicit=self.client._use_accelerator is True)
@@ -1095,6 +1099,18 @@ class _DataApiTarget(abc.ABC):
             server.close()
             raise
         self._accelerator_daemon = server
+        try:
+            self._accelerator_health = AcceleratorHealthMonitorType(
+                self._accelerator_client, self._accelerator_breaker
+            )
+            self._accelerator_health.start()
+        except Exception as exc:
+            warnings.warn(
+                f"Could not start the accelerator health monitor; the accelerator will run without health-based fallback: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self._accelerator_health = None
 
     def _use_accelerator(self, method_name: str) -> bool:
         """Whether this call should be routed through the accelerator daemon.
@@ -1877,6 +1893,11 @@ class _DataApiTarget(abc.ABC):
         self.client._remove_instance_registration(
             self.instance_id, self.app_profile_id, id(self)
         )
+        if self._accelerator_health is not None:
+            try:
+                self._accelerator_health.close()
+            finally:
+                self._accelerator_health = None
         if self._accelerator_client is not None:
             try:
                 self._accelerator_client.close()
