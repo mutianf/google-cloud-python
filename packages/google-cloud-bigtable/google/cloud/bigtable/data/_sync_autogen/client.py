@@ -63,12 +63,12 @@ from google.cloud.bigtable.data._metrics import (
     BigtableClientSideMetricsController,
     OperationType,
 )
-from google.cloud.bigtable.data._metrics.tracked_retry import tracked_retry
 from google.cloud.bigtable.data._metrics.handlers._base import MetricsHandler
 from google.cloud.bigtable.data._metrics.handlers.gcp_exporter import (
     BigtableMetricsExporter,
     GoogleCloudMetricsHandler,
 )
+from google.cloud.bigtable.data._metrics.tracked_retry import tracked_retry
 from google.cloud.bigtable.data._sync_autogen._swappable_channel import (
     SwappableChannel as SwappableChannelType,
 )
@@ -1431,6 +1431,7 @@ class _DataApiTarget(abc.ABC):
         attempt_timeout: float | None | TABLE_DEFAULT = TABLE_DEFAULT.MUTATE_ROWS,
         retryable_errors: Sequence[type[Exception]]
         | TABLE_DEFAULT = TABLE_DEFAULT.MUTATE_ROWS,
+        metadata: Sequence[tuple[str, str]] = (),
     ):
         """Applies mutations for multiple rows in a single batched request.
 
@@ -1473,6 +1474,7 @@ class _DataApiTarget(abc.ABC):
             attempt_timeout,
             metric=self._create_operation(OperationType.BULK_MUTATE_ROWS),
             retryable_exceptions=retryable_excs,
+            metadata=metadata,
         )
         operation.start()
 
