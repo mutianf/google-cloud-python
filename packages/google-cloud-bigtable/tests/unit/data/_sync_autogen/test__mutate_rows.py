@@ -330,8 +330,8 @@ class TestMutateRowsOperation:
     def test_run_attempt_missing_entry_retryable(self):
         """If the server closes the stream successfully but omits a response
         entry, the unanswered mutation must not be treated as successful. It
-        should be recorded as a retryable _MutateRowsIncomplete error so
-        idempotent entries are retried."""
+        should be recorded as an InternalServerError."""
+        from google.api_core.exceptions import InternalServerError
         from google.cloud.bigtable.data.exceptions import _MutateRowsIncomplete
 
         mutations = [
@@ -348,13 +348,13 @@ class TestMutateRowsOperation:
         assert instance.remaining_indices == [1]
         assert 0 not in instance.errors
         assert len(instance.errors[1]) == 1
-        assert isinstance(instance.errors[1][0], _MutateRowsIncomplete)
+        assert isinstance(instance.errors[1][0], InternalServerError)
         assert 2 not in instance.errors
 
     def test_run_attempt_missing_entry_non_retryable(self):
         """A missing response entry for a non-retryable mutation is surfaced as
-        a failure rather than being silently dropped."""
-        from google.cloud.bigtable.data.exceptions import _MutateRowsIncomplete
+        an InternalServerError failure rather than being silently dropped."""
+        from google.api_core.exceptions import InternalServerError
 
         mutations = [self._make_mutation(), self._make_mutation()]
         mock_gapic_fn = self._make_mock_gapic(mutations, omit_indices={0})
@@ -364,5 +364,30 @@ class TestMutateRowsOperation:
             instance._run_attempt()
         assert instance.remaining_indices == []
         assert len(instance.errors[0]) == 1
-        assert isinstance(instance.errors[0][0], _MutateRowsIncomplete)
+        assert isinstance(instance.errors[0][0], InternalServerError)
         assert 1 not in instance.errors
+
+    def test_start_missing_response_entry(self):
+        """When a 3-entry request receives only indices 0 and 2 on normal stream close,
+        MutationsExceptionGroup is raised without retrying and contains FailedMutationEntryError with InternalServerError for index 1."""
+        from google.api_core.exceptions import InternalServerError
+        from google.cloud.bigtable.data.exceptions import FailedMutationEntryError
+        from google.cloud.bigtable.data.exceptions import MutationsExceptionGroup
+
+        mutations = [
+            self._make_mutation(),
+            self._make_mutation(),
+            self._make_mutation(),
+        ]
+        mock_gapic_fn = self._make_mock_gapic(mutations, omit_indices={1})
+        instance = self._make_one(mutation_entries=mutations)
+        with mock.patch.object(instance, "_gapic_fn", mock_gapic_fn):
+            with pytest.raises(MutationsExceptionGroup) as exc_info:
+                instance.start()
+        assert mock_gapic_fn.call_count == 1
+        err_group = exc_info.value
+        assert len(err_group.exceptions) == 1
+        entry_err = err_group.exceptions[0]
+        assert isinstance(entry_err, FailedMutationEntryError)
+        assert entry_err.index == 1
+        assert isinstance(entry_err.__cause__, InternalServerError)

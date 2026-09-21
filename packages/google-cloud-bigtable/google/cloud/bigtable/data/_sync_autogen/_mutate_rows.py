@@ -176,8 +176,8 @@ class _MutateRowsOperation:
         for idx in active_request_indices.values():
             self._handle_entry_error(
                 idx,
-                bt_exceptions._MutateRowsIncomplete(
-                    "no response entry received for mutation"
+                core_exceptions.InternalServerError(
+                    "Mutation result missing from server response"
                 ),
             )
         if self.remaining_indices:

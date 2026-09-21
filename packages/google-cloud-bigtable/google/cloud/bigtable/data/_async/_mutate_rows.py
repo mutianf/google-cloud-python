@@ -216,14 +216,14 @@ class _MutateRowsOperationAsync:
             raise
         # Any entries that were sent but never received a response entry (a
         # successfully-closed but incomplete stream) must not be treated as
-        # successful. Record a retryable error so idempotent entries are retried
-        # and non-idempotent entries surface as failures instead of being
-        # silently dropped.
+        # successful. Record an InternalServerError so missing entries surface
+        # immediately as non-retryable INTERNAL failures instead of being
+        # silently dropped or infinitely retried.
         for idx in active_request_indices.values():
             self._handle_entry_error(
                 idx,
-                bt_exceptions._MutateRowsIncomplete(
-                    "no response entry received for mutation"
+                core_exceptions.InternalServerError(
+                    "Mutation result missing from server response"
                 ),
             )
         # check if attempt succeeded, or needs to be retried
