@@ -1158,12 +1158,7 @@ class _DataApiTarget(abc.ABC):
             )
         except _AcceleratorUnverified:
             server.close()
-            warnings.warn(
-                "Accelerator disabled: could not verify that the daemon resolves the same identity as this client; using the native client instead.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            return
+            raise
         except BaseException:
             server.close()
             raise
