@@ -46,6 +46,15 @@ from google.api_core import exceptions as core_exceptions
 if TYPE_CHECKING:
     from google.cloud.bigtable.data._accelerator._daemon import AcceleratorDaemon
 
+# Status detail prefixes emitted by the Go accelerator sidecar for per-request
+# fallback signals (e.g. "accelerator: request diverted by session load" or
+# single-row shape rejections). These fall back for the current call without
+# tripping the sticky breaker.
+_PER_REQUEST_UNIMPLEMENTED_PREFIXES = (
+    "accelerator:",
+    "accelerator fallback:",
+)
+
 
 class _AcceleratorFallback(Exception):
     """Internal signal that an accelerator attempt should be retried natively.
@@ -122,6 +131,22 @@ def _grpc_code(exc: BaseException) -> StatusCode | None:
         return None
 
 
+def _is_per_request_unimplemented(exc: BaseException) -> bool:
+    """Return True if an UNIMPLEMENTED error is a per-request sidecar fallback
+    signal (such as session-load diversion or unsupported request shape) rather
+    than a persistent session/instance unavailability."""
+    details_fn = getattr(exc, "details", None)
+    if not callable(details_fn):
+        return False
+    try:
+        details = details_fn()
+    except Exception:
+        return False
+    if not isinstance(details, str):
+        return False
+    return details.strip().lower().startswith(_PER_REQUEST_UNIMPLEMENTED_PREFIXES)
+
+
 def handle_accelerator_error(
     exc: BaseException,
     *,
@@ -135,7 +160,8 @@ def handle_accelerator_error(
     exception for the caller to propagate:
 
     * daemon subprocess dead -> trip the breaker, fall back (it will not recover)
-    * ``UNIMPLEMENTED`` -> trip the breaker, fall back immediately
+    * per-request ``UNIMPLEMENTED`` (e.g. session-load diversion) -> fall back without tripping
+    * backend ``UNIMPLEMENTED`` -> trip the breaker, fall back immediately
     * any other gRPC error -> translate and raise
     * a non-gRPC exception -> re-raise unchanged (never masked as a fallback)
     """
@@ -153,9 +179,7 @@ def handle_accelerator_error(
         # as a fallback; let it propagate unchanged.
         raise exc
     if _grpc_code(exc) == StatusCode.UNIMPLEMENTED:
-        # The daemon only replies UNIMPLEMENTED once it has no working sessions,
-        # a persistent condition, so trip the breaker and fall back immediately
-        # rather than re-dialing on every subsequent call.
-        breaker.trip()
+        if not _is_per_request_unimplemented(exc):
+            breaker.trip()
         raise _AcceleratorFallback() from exc
     raise core_exceptions.from_grpc_error(exc) from exc
