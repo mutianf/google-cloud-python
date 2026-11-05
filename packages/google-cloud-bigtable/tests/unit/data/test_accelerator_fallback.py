@@ -91,6 +91,21 @@ class TestHandleAcceleratorError:
             handle_accelerator_error(exc, daemon=None, breaker=breaker)
         assert breaker.bypass() is True
 
+    @pytest.mark.parametrize(
+        "details",
+        [
+            "accelerator: request diverted by session load",
+            "accelerator: ReadRows must specify exactly one row (got 2 row keys, 0 row ranges)",
+            "accelerator fallback: unary method /foo not supported",
+        ],
+    )
+    def test_per_request_unimplemented_falls_back_without_tripping(self, details):
+        breaker = AcceleratorBreaker()
+        exc = _aio_error(grpc.StatusCode.UNIMPLEMENTED, details)
+        with pytest.raises(_AcceleratorFallback):
+            handle_accelerator_error(exc, daemon=None, breaker=breaker)
+        assert breaker.bypass() is False
+
     def test_dead_daemon_falls_back_and_trips_regardless_of_status(self):
         breaker = AcceleratorBreaker()
         # UNAVAILABLE, not UNIMPLEMENTED: liveness is checked first, so a dead
